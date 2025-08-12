@@ -1,0 +1,35 @@
+method: grid
+project: ARD-SR-hyperparameter
+program: main.py
+parameters:
+  dataset:
+    values: ["filmtrust"] # , "ciao", "douban"] #, "ciao", "douban", "douban_book", "epinions", "filmtrust", "flickr", "yelp"] # , "yelp2", "yelp3"] # "lastfm"] # , "ciao"] # "ciao", "douban", "douban_book", "epinions", "filmtrust", "flickr", "lastfm", "yelp", "yelp2", "yelp3"
+  lr:
+    values: [1e-3, 1e-4, 1e-5] # , 1e-2, 1e-3, 1e-4, 1e-5] # 1e-4, 1e-5] # 1e-4, 1e-5] # , 1e-2, 1e-3] # , 1e-3] # 1e-4, 1e-5] # , 1e-2, 1e-3, 1e-4, 1e-5]
+  gpu_id:
+    value: 0
+  wandb:
+    value: True
+  topN:
+    value: "[10,20,50]"
+  method:
+    value: "original" # "gumbel"
+    # lastfm original(예전에 돌린 결과) hr0.5803 mrr0.2941 ndcg0.1773 recall0.2051
+  steps:
+    values: [100] #, 200]
+  noise_scale:
+    values: [1e-2] # , 1e-3]
+  noise_min:
+    values: [1e-4] # , 1e-4]
+  noise_max:
+    values: [1e-1] # , 1e-2]
+  threshold:
+    values: [0.6]
+  temp:
+    values: [0.1]  
+  # gumbel_temp:
+  #   values: [0.2, 0.4]
+  # cos_s:
+  #   values: [0.75]
+  # alpha:
+  #   values: [0.3, 0.5, 0.7]    
