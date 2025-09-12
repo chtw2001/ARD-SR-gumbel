@@ -62,12 +62,12 @@ def computeTopNAccuracy(GroundTruth, predictedIndices, topN):
                 if hit:
                     sumForHR += 1  # Increment sumForHR if there was a hit
         
-        precision.append(round(sumForPrecision / len(predictedIndices), 4))
-        recall.append(round(sumForRecall / len(predictedIndices), 4))
-        NDCG.append(round(sumForNdcg / len(predictedIndices), 4))
-        MRR.append(round(sumForMRR / len(predictedIndices), 4))
-        HR.append(round(sumForHR / len(predictedIndices), 4))
-        F1.append(round(f1(precision[index], recall[index]), 4))
+        precision.append(round(sumForPrecision / len(predictedIndices), 8))
+        recall.append(round(sumForRecall / len(predictedIndices), 8))
+        NDCG.append(round(sumForNdcg / len(predictedIndices), 8))
+        MRR.append(round(sumForMRR / len(predictedIndices), 8))
+        HR.append(round(sumForHR / len(predictedIndices), 8))
+        F1.append(round(f1(precision[index], recall[index]), 8))
         
     return precision, recall, NDCG,MRR,HR,F1
 

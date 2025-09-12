@@ -15,10 +15,6 @@ class DataLoaderBase(data.Dataset):
         self.data_dir = os.path.join(args.data_path, args.dataset)
         self.num_ng=1
         
-        # 재현성을 위한 seed 설정
-        self.seed = args.seed
-        np.random.seed(self.seed)
-
         self.train_file = os.path.join(self.data_dir, 'train_list.npy')
         self.valid_file = os.path.join(self.data_dir, 'valid_list.npy')
         self.test_file = os.path.join(self.data_dir, 'test_list.npy')
@@ -34,9 +30,9 @@ class DataLoaderBase(data.Dataset):
 
     def ng_sample(self): 
         # 재현성을 위해 seed 재설정
-        np.random.seed(self.seed)
+        np.random.seed(self.args.seed)
         import random
-        random.seed(self.seed)
+        random.seed(self.args.seed)
         
         self.train_fill=[]
         for x in range(len(self.cf_train_data[0])):

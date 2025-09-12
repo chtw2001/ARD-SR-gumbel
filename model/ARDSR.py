@@ -7,6 +7,7 @@ import torch.nn as nn
 import random
 import sys
 from .DNN import DNN
+# import networkx as nx
 import os, gc
 
 
@@ -117,7 +118,7 @@ class ARDSR(nn.Module):
         # ts: random timestep (batch, )
         ts, pt = self.sample_timesteps(batch_size, device)
         # Set seed for reproducible noise generation
-        torch.manual_seed(42)
+        torch.manual_seed(self.args.seed)
         noise = torch.randn_like(x_start)
         
         # (batch, user)
@@ -158,7 +159,7 @@ class ARDSR(nn.Module):
 
     def sample_timesteps(self, batch_size, device):
         # Set seed for reproducible timestep sampling
-        torch.manual_seed(42)
+        torch.manual_seed(self.args.seed)
         
         t = torch.randint(0, self.steps, (batch_size,), device=device).long()
         pt = torch.ones_like(t).float()
@@ -170,7 +171,7 @@ class ARDSR(nn.Module):
         #t,m,m
         if noise is None:
             # Set seed for reproducible noise generation
-            torch.manual_seed(42)
+            torch.manual_seed(self.args.seed)
             noise = torch.randn_like(x_start)
         
         q_t= self.extract_from_tensor(self.sqrt_alphas_cumprod,t) *x_start + self.extract_from_tensor(self.sqrt_one_minus_alphas_cumprod,t)*noise
@@ -255,7 +256,7 @@ class ARDSR(nn.Module):
             out = self.p_mean_variance(x_t,t,input_embed)
             if sampling_noise:
                 # Set seed for reproducible noise generation
-                torch.manual_seed(42)
+                torch.manual_seed(self.args.seed)
                 noise = torch.randn_like(x_t)
                 nonzero_mask = (
                     (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1))) )  # no noise when t == 0
@@ -311,9 +312,9 @@ def mean_cross_entropy_for_ones(social_data, new_score):
     
     return mean_cross_entropy
 
-def flip_tensor(idx_tensor, cos_similarities):
+def flip_tensor(idx_tensor, cos_similarities, seed):
     # Set seed for reproducible random sampling
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     
     sigmoid_pos = torch.sigmoid(cos_similarities)  # sigmoid(x)
     sigmoid_neg = 1 - sigmoid_pos  # sigmoid(-x)
@@ -368,7 +369,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         with torch.no_grad():
             if flip:
                 cos_similarities = all_cos_sim[idx_tensor].squeeze(0)
-                flipped_batch = flip_tensor(batch, cos_similarities).to(args.device)
+                flipped_batch = flip_tensor(batch, cos_similarities, args.seed).to(args.device)
                 prediction = diffusion.p_sample(flipped_batch, idx_tensor, all_embed, all_social, args.steps, args.steps)
             else:
                 prediction = diffusion.p_sample(batch, idx_tensor, all_embed, all_social, args.steps, args.steps)
@@ -434,3 +435,4 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     gc.collect()
     
     return h_list, t_list, new_score.cpu().numpy(), decay
+

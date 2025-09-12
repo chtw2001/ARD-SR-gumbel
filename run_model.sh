@@ -9,5 +9,4 @@ WANDB_API_KEY=$WANDB_API_KEY \
 PYTHONUNBUFFERED=1 \
 PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128" \
 CUBLAS_WORKSPACE_CONFIG=":4096:8" \
-CUDNN_BENCHMARK=1 \
 nohup /home/taekwon/.conda/envs/ARD-SR-debug/bin/wandb agent $sweep_path > $logfile 2>&1 &

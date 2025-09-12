@@ -35,10 +35,11 @@ def train(args,log_path):
 
 
     data = SRDataLoader(args, logging)
-    train_loader = torch_data.DataLoader(data, batch_size=1024, shuffle=False, num_workers=4, worker_init_fn=worker_init_fn)
+    train_loader = torch_data.DataLoader(data,batch_size=1024, shuffle=False, worker_init_fn=worker_init_fn)
     original_social_data = sp.csr_matrix((np.ones_like(data.train_social_h_list), 
     (data.train_social_h_list, data.train_social_t_list)), dtype='float32', shape=(data.n_users, data.n_users))
     social_data = original_social_data.copy()
+
     ### Build SR and Diffusion Model ###
     # 모델 생성 전 seed 재설정
     set_seed(args.seed)
@@ -53,11 +54,11 @@ def train(args,log_path):
         LINE_optimizer = optim.Adam(LINE_MODULE.parameters(), lr=args.lr)
         new_social, ce_prev = None, None
         A_target   = torch.FloatTensor(social_data.A).to(device)  # EMA target
-        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A), 0, seed=args.seed)
-        cur_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, worker_init_fn=worker_init_fn)
+        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
+        cur_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn)
     elif args.method == "original":
-        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A), 0, seed=args.seed)
-        diffusion_train_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, worker_init_fn=worker_init_fn)
+        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
+        diffusion_train_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn)
         new_score=social_data.A
         diffusion = ARDSR(data,args).to(device)
         diffusion_optimizer = optim.Adam(diffusion.parameters(),lr=args.lr)
@@ -146,27 +147,70 @@ def train(args,log_path):
                 print("LINE train done")
                 # (3) retain mask → 새 social_data
                 if (epoch-1) % args.line_period == 0:
-                    h, t = refine_social_with_LINE(LINE_MODULE, user_e)
-                    print(f"[DBG refine] h range = {h.min()}~{h.max()},  t range = {t.min()}~{t.max()}")
-                    print("refine social done")
-                    max_idx = max(h.max(), t.max()) + 1
-                    social_data = sp.csr_matrix((np.ones_like(h),(h, t)),shape=(data.n_users, data.n_users),dtype='float32')
+                    with torch.no_grad():
+                        weight, h, t = refine_social_with_LINE(LINE_MODULE, user_e)
+                        print("refine social done")
 
-                    # (4-A) EMA 타깃 업데이트
-                    A_pred   = torch.FloatTensor(social_data.A).to(A_target.device)
-                    A_target = args.alpha * A_target + (1-args.alpha) * A_pred
-                    ce_prev  = mean_cross_entropy_for_ones(social_data, A_target.cpu().numpy())
-                    # (4-B) curriculum 로더에 새 행렬 반영
-                    
-                    new_idx = torch.tensor(np.stack([h, t], axis=1),dtype=torch.long,device=LINE_MODULE.nonzero_idx.device)
-                    LINE_MODULE.nonzero_idx = new_idx
+                        # 지수이동평균
+                        h = h.to(A_target.device)
+                        t = t.to(A_target.device)
+                        w = weight.to(A_target.device).float()
+                        
+                        A_target.mul_(args.alpha)                                  # A_t = α · A_{t-1}
+                        A_target[h.to(device), t.to(device)] += (1.0 - args.alpha) * w.to(device)
+                        
+                        
+                        N = A_target.size(0)
+                        init_idx  = LINE_MODULE.init_nonzero_idx.to(A_target.device)   # [E0,2]
+                        init_keys = init_idx[:, 0] * N + init_idx[:, 1]                # [E0]
+                        cur_keys  = h * N + t                                          # [M]
+                        mask_init_keep = torch.isin(cur_keys, init_keys)               # [M] bool
 
-                    # (4-C) SR 백본·DataLoader 갱신
-                    data.train_social_h_list = h
-                    data.train_social_t_list = t
-                    cur_loader = build_line_curriculum_loader(social_data, epoch, ce_prev, args.line_batch, seed=args.seed)
-                    new_social = np.vstack([h, t])
-                    model.init_channel()
+                        if mask_init_keep.any():
+                            h_keep = h[mask_init_keep]
+                            t_keep = t[mask_init_keep]
+                            # 값=1로 직접 덮어쓰기(EMA 반영 후)
+                            A_target.index_put_((h_keep, t_keep),
+                                                torch.ones_like(h_keep, dtype=A_target.dtype))
+                        
+                        
+                        # 1) 원본 엣지 인덱스
+                        orig_idx = LINE_MODULE.nonzero_idx
+                        orig_idx = orig_idx.to(h.device)
+                        orig_h, orig_t = orig_idx[:, 0], orig_idx[:, 1]
+                        
+                        # 2) 합집합 인덱스(원본 ∪ refine)
+                        h_all = torch.cat([orig_h, h], dim=0)
+                        t_all = torch.cat([orig_t, t], dim=0)
+                        
+                        # 3) (h_all, t_all) 중복 제거
+                        keys = h_all * N + t_all
+                        uniq_keys = torch.unique(keys)
+                        h_u = (uniq_keys // N).long()
+                        t_u = (uniq_keys %  N).long()
+
+                        # 4) EMA에서 해당 위치의 최종 가중치 읽어오기
+                        h_u_dev = h_u.to(A_target.device)
+                        t_u_dev = t_u.to(A_target.device)
+                        w_u = A_target[h_u_dev, t_u_dev]     # EMA 반영된 실수 가중치
+                        
+                        social_data = sp.csr_matrix((w_u.detach().cpu().numpy(),
+                                                    (h_u.detach().cpu().numpy(), t_u.detach().cpu().numpy()))
+                                                    ,shape=(data.n_users, data.n_users),
+                                                    dtype='float32')
+                        
+                        ce_prev  = mean_cross_entropy_for_ones(social_data, A_target.detach().cpu().numpy())
+                        # (4-B) curriculum 로더에 새 행렬 반영
+                        
+                        new_idx = torch.stack([h_u_dev.long(), t_u_dev.long()], dim=1).to(LINE_MODULE.nonzero_idx.device)
+                        LINE_MODULE.nonzero_idx = new_idx
+
+                        # (4-C) SR 백본·DataLoader 갱신
+                        data.train_social_h_list = h_u.detach().cpu().numpy()
+                        data.train_social_t_list = t_u.detach().cpu().numpy()
+                        cur_loader = build_line_curriculum_loader(social_data, epoch, ce_prev, args.line_batch)
+                        new_social = np.vstack([data.train_social_h_list, data.train_social_t_list])
+                        model.init_channel()
                         
         elif args.method == "original":
             if epoch >10:
@@ -209,8 +253,8 @@ def train(args,log_path):
 
                     social_data = sp.csr_matrix((np.ones_like(h),(h,t)), dtype='float32', shape=(data.n_users, data.n_users))
                     ce_for_1s = mean_cross_entropy_for_ones(social_data,new_score)
-                    train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A), epoch, ce_for_1s, seed=args.seed)
-                    diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, worker_init_fn=worker_init_fn) 
+                    train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),epoch,ce_for_1s)
+                    diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn) 
                     data.train_social_h_list=h
                     data.train_social_t_list=t
                     model.init_channel()
@@ -269,27 +313,20 @@ def set_seed(seed):
     import torch
     import os
 
-    # 모든 random 관련 seed 설정
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed) # cpu
-    
-    # CUDA 관련 seed 설정
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)  # gpu
-        torch.cuda.deterministic = True
-        torch.cuda.empty_cache()
-    
-    # PyTorch deterministic 설정
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # gpu
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    # Python hash seed 설정
     os.environ['PYTHONHASHSEED'] = str(seed)
     
-    # 추가 deterministic 설정
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    # # CUDA deterministic 설정 추가
+    if torch.cuda.is_available():
+        torch.cuda.deterministic = True
+        torch.cuda.empty_cache()
+    torch.use_deterministic_algorithms(True)
     
     print(f"Set seed {seed}...")
 
@@ -299,29 +336,13 @@ def worker_init_fn(worker_id):
     import numpy as np
     import random
     import torch
-    import os
     
-    # 메인 프로세스의 seed를 기반으로 worker별 고유 seed 생성
-    # worker_id를 포함하여 각 worker마다 다른 seed 사용
-    base_seed = torch.initial_seed()
-    worker_seed = (base_seed + worker_id) % 2**32
-    
-    # 모든 random 관련 seed 설정
+    worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
     torch.manual_seed(worker_seed)
-    
-    # CUDA 관련 seed 설정
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(worker_seed)
-        torch.cuda.manual_seed_all(worker_seed)
-    
-    # Python hash seed 설정
-    os.environ['PYTHONHASHSEED'] = str(worker_seed)
-    
-    # PyTorch deterministic 설정
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.cuda.manual_seed(worker_seed)
+    torch.cuda.manual_seed_all(worker_seed)
 
 
 if __name__ == '__main__':
@@ -330,7 +351,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='lastfm')
     parser.add_argument('--data_path', type=str, default='datasets/')
     parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--stopping_steps', type=int, default=50)
+    parser.add_argument('--stopping_steps', type=int, default=30)
     parser.add_argument('--topN', type=str, default='[10,20,50]')
     parser.add_argument('--device', nargs='?', default=3,type=int)  
     parser.add_argument('--seed', type=int, default=42)  
@@ -408,7 +429,7 @@ if __name__ == '__main__':
     args.dataset,args.lr,args.method,now)
     args.save_dir = save_dir
 
-    log_path='logs/{}/RD-SR-gumbel_{}/lr{}/{}'.format(
+    log_path='logs/{}/ARD-SR-gumbel_{}/lr{}/{}'.format(
     args.dataset,args.lr,args.method,now)
     
     train(args,log_path)

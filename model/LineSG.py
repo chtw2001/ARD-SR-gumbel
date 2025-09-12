@@ -25,6 +25,7 @@ class LINESG(nn.Module):
         # nonzero_idx: 에지가 존재하는 u-v 쌍
         idx_arr = torch.tensor(nonzero_idx, dtype=torch.long)  # shape [E,2]
         self.register_buffer('nonzero_idx', idx_arr)
+        self.register_buffer('init_nonzero_idx', idx_arr.clone())
         # print(f"[DBG init] nonzero_idx range: {idx_arr[:,0].min()}/{idx_arr[:,0].max()}  ,  {idx_arr[:,1].min()}/{idx_arr[:,1].max()}")
         # self.nonzero_idx = nonzero_idx
         self.latent_size = latent_size
@@ -38,7 +39,7 @@ class LINESG(nn.Module):
         if hasattr(args, 'seed'):
             torch.manual_seed(args.seed)
             np.random.seed(args.seed)
-
+        
     # Step1
     # 에지가 없는 u-v 쌍에서 어느 것을 추가 할지 후보군 선택.
     # 기존에 존재하는 u-v 쌍은 제외, self-loop 제외
@@ -50,7 +51,6 @@ class LINESG(nn.Module):
         # 2) Exclude self and original edges
         n_idx = self.nonzero_idx               # LongTensor [E,2]
         cos.fill_diagonal_(-1)
-        # directed edge만 masking
         cos[n_idx[:,0], n_idx[:,1]] = -1
 
         # 3) Threshold and nonzero in torch
@@ -82,21 +82,26 @@ class LINESG(nn.Module):
 
         print(f"방향성(mutual) 쌍 수: {a}, 유니크(mutual/2) 쌍 수: {b}")
         '''
-        return candidate_pair_idx, candidate_pair_values
+        return candidate_pair_idx, candidate_pair_values, cos
     
     # Step3
-    def get_edge_weight(self, gumbel_retain, candidate_pair_value):
+    def get_edge_weight(self, gumbel_retain, candidate_pair_value, cos):
+    
+        cos = cos.to(self.device)
+
+        # 1) 원본 엣지 구간의 cosine
+        orig_idx = self.nonzero_idx.to(self.device)               # [E,2]
+        orig_cos = cos[orig_idx[:, 0], orig_idx[:, 1]].unsqueeze(1)  # [E,1]
+        orig_cos = orig_cos.clamp(min=0)  # 음수는 0으로
+        
+        
         candidate_pair_value = candidate_pair_value.unsqueeze(1).to(self.device)
         # 값이 0 미만인 pair는 모두 0으로 mask
         candidate_pair_value = candidate_pair_value.masked_fill(candidate_pair_value < 0, 0)  # neg to 0
 
-        # 남겨치는 에지에는 가중치를 1로, 값이 0 미만인 에지에는 mask된 0을 곱하여 weight 계산
-        orig_weights = torch.ones(len(self.nonzero_idx), 1, device=self.device)
-        gumbel_retain_w = gumbel_retain * torch.cat([orig_weights, candidate_pair_value], dim=0).squeeze()
-        gumbel_01 = gumbel_retain_w.clone()
-
-        # (2, E+K) 사이즈로 만듬. 0 -> no edge, 1 -> edge
-        gumbel_retain_w = torch.cat([torch.unsqueeze(gumbel_retain_w, dim=1), torch.unsqueeze(gumbel_retain_w, dim=1)], dim=0)
+        base = torch.cat([orig_cos, candidate_pair_value], dim=0).squeeze(1)
+        gumbel_01 = gumbel_retain * base
+        gumbel_retain_w = torch.stack([gumbel_01, gumbel_01], dim=0)
 
         return gumbel_01, gumbel_retain_w
 
@@ -104,14 +109,14 @@ class LINESG(nn.Module):
     def forward(self, user_emb):
 
         # 추가할 에지 후보 인덱스 및 weight
-        candidate_pair_idx, candidate_pair_value = self.get_candidate_pair(user_emb)
+        candidate_pair_idx, candidate_pair_value, cos = self.get_candidate_pair(user_emb)
         
         # 원본 에지 + 후보 에지 합치기
         self.pair_idx = torch.cat([self.nonzero_idx, candidate_pair_idx], dim=0)
 
         # Step2: Edge Addition and Dropping
-        u_idx = self.pair_idx[:,0]
-        v_idx = self.pair_idx[:,1]
+        u_idx = self.pair_idx[:, 0].to(self.device).long()
+        v_idx = self.pair_idx[:, 1].to(self.device).long()
 
         u_embeddings  = F.embedding(u_idx.to(self.device), user_emb)
         v_embeddings  = F.embedding(v_idx.to(self.device), user_emb)
@@ -132,7 +137,7 @@ class LINESG(nn.Module):
         #     gumbel_retain = self.get_edge_weight(gumbel_retain, candidate_pair_value)
         # else:
         #     gumbel_retain = torch.cat([torch.unsqueeze(gumbel_retain, dim=1), torch.unsqueeze(gumbel_retain, dim=1)], dim=0)
-        gumbel_01, gumbel_retain = self.get_edge_weight(gumbel_retain, candidate_pair_value)
+        gumbel_01, gumbel_retain = self.get_edge_weight(gumbel_retain, candidate_pair_value, cos)
 
         return gumbel_01, gumbel_retain, self.pair_idx
 # ===============================================
@@ -186,40 +191,29 @@ def train_line_module_one_epoch(LINE_MODULE,
                                 neg_k=5, use_mse=False, A_target=None):
     
     LINE_MODULE.train()
-    u_all = LINE_MODULE.nonzero_idx[:, 0]   # LongTensor[E] on GPU
-    i_all = LINE_MODULE.nonzero_idx[:, 1]   # LongTensor[E] on GPU
-
+    
     total_loss = 0
     n_batches = 0
     for batch_users, _ in cur_loader:           # batch_users : python list(int)
         batch_users = batch_users.to(user_emb.device).long()
 
-        # (1) positive mask
-        mask  = (u_all[:, None] == batch_users[None, :]).any(1)
-        pos_u = u_all[mask]
-        pos_i = i_all[mask]
-        if len(pos_u) == 0:
+        g01, _, pair_idx = LINE_MODULE(user_emb)   # g01: [E+K], pair_idx: [E+K,2]
+
+        # 이번 배치의 head(u)가 포함된 쌍만 학습
+        row_m = torch.isin(pair_idx[:, 0], batch_users)
+        if not row_m.any():
             continue
 
-        # (2) loss 계산
-        if use_mse:
-            g01, _, pair_idx = LINE_MODULE(user_emb)   # hard mask
-            row_m = torch.isin(pair_idx[:,0], batch_users)
-            pred = g01.float()[row_m]
-            tgt  = A_target[pair_idx[row_m, 0], pair_idx[row_m, 1]]
-            loss = F.mse_loss(pred, tgt.float())
-        else:   # skip-gram
-            z_u, z_i = user_emb[pos_u], item_emb[pos_i]
-            pos_s = (z_u * z_i).sum(1)
-            # Set seed for reproducible negative sampling
-            torch.manual_seed(42)
-            neg_i = torch.randint(0, item_emb.size(0),
-                                  (len(pos_u), neg_k),
-                                  device=user_emb.device)
-            neg_s = (z_u.unsqueeze(1) * item_emb[neg_i]).sum(2)
-            loss  = -F.logsigmoid(pos_s).mean() \
-                    - F.logsigmoid(-neg_s).mean()
-        
+        # 예측
+        pred = g01.float()[row_m]
+
+        # 타깃: "초기 원본 인접행렬(0/1)"에서 같은 (u,v) 위치 값
+        u = pair_idx[row_m, 0].long()
+        v = pair_idx[row_m, 1].long()
+        tgt   = A_target[u, v].float()     # ← “직전 에폭” 기준 타깃
+        loss  = F.mse_loss(pred, tgt)
+            
+            
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -239,39 +233,52 @@ def refine_social_with_LINE(LINE_MODULE, user_emb):
     with torch.no_grad():
         gumbel01, _, pair_idx = LINE_MODULE(user_emb)     # step1~3
 
-    keep = gumbel01.bool()
-    all_idx = pair_idx[keep]        # [M,2] LongTensor
-    # split
-    n_orig = LINE_MODULE.nonzero_idx.size(0)
-    keep_orig = all_idx[:n_orig]
-    keep_cand = all_idx[n_orig:]
+    keep = gumbel01 > 0
+    final = pair_idx[keep]                     # [E',2]
+    w = gumbel01[keep].float()                      # [E']
+    h = final[:, 0].long()
+    t = final[:, 1].long()
     
-    orig_edges = set(map(tuple, LINE_MODULE.nonzero_idx.cpu().tolist()))
-    new_edges  = set(map(tuple, torch.cat([keep_orig, keep_cand], dim=0).cpu().tolist()))
-
-    # 5) 추가/제거 계산
+    # ---------- 통계 출력 ----------
+    # 원래 엣지(현재 nonzero_idx)와 최종 엣지(final)를 비교
     U = user_emb.size(0)
-    P = U * (U - 1)
-    removed = orig_edges - new_edges
-    added   = new_edges  - orig_edges
-    removed_pct = len(removed) / P * 100
-    added_pct   = len(added)   / P * 100
-    print(f"[REFINE FULL] 원본 엣지: {len(orig_edges)}({round(len(orig_edges)/P*100, 2)}%), "
-          f"제거된 엣지: {len(removed)}({round(removed_pct, 2)}%), "
-          f"추가된 엣지: {len(added)}({round(added_pct, 2)}%)")
+    denom = max(U * (U - 1), 1)          # self-loop 제외 가정(분모 0 방지)
+
+    # 디바이스 맞추기
+    device = pair_idx.device
+    orig_idx = LINE_MODULE.nonzero_idx.to(device)          # [E,2]
+
+    # (u,v) → 선형키 u*N+v 로 집합 연산
+    orig_keys  = (orig_idx[:, 0] * U + orig_idx[:, 1]).long()
+    final_keys = (final[:,    0] * U + final[:,    1]).long()
+
+    E_orig  = orig_keys.numel()
+    E_final = final_keys.numel()
+
+    # 집합 차집합으로 추가/삭제 개수 계산
+    # (torch.isin은 브로드캐스팅 없이 GPU에서 빠르게 동작)
+    removed_mask = ~torch.isin(orig_keys,  final_keys)     # 원래 있었는데 사라진 엣지
+    added_mask   = ~torch.isin(final_keys, orig_keys)      # 새로 추가된 엣지
+
+    num_removed = int(removed_mask.sum().item())
+    num_added   = int(added_mask.sum().item())
+
+    dens_orig  = E_orig  / denom
+    dens_final = E_final / denom
+
+    print(f"[LINE refine] orig:  {E_orig} edges (density {dens_orig:.4%})")
+    print(f"[LINE refine] delta: +{num_added} added, -{num_removed} removed")
+    print(f"[LINE refine] final: {E_final} edges (density {dens_final:.4%})")
+    # --------------------------------
     
-    # social-only: user–user 페어만
-    # 합치고 반환
-    final = torch.cat([keep_orig, keep_cand], dim=0)  # [E',2]
-    h = final[:,0].cpu().numpy()
-    t = final[:,1].cpu().numpy()
-    return h, t
+    
+    return w, h, t   
 
 # ===============================================
 
 # ===================== ADD:taekwon =====================  
-def build_line_curriculum_loader(social_csr, epoch, ce_1s, line_batch, seed=42):
-    line_dataset = DataDiffusionCL(social_csr.A, current_epoch=epoch, ce=ce_1s, seed=seed)
-    return DataLoader(line_dataset, batch_size=line_batch, shuffle=False, drop_last=False, num_workers=2, worker_init_fn=worker_init_fn)
+def build_line_curriculum_loader(social_csr, epoch, ce_1s, line_batch):
+    line_dataset = DataDiffusionCL(social_csr.A,current_epoch=epoch,ce=ce_1s)
+    return DataLoader(line_dataset,batch_size=line_batch, shuffle=False, drop_last=False)
 # ===============================================
 
