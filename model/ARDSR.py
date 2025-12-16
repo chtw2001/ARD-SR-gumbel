@@ -85,29 +85,40 @@ class ARDSR(nn.Module):
         return score
 
     def calculate_batch_for_diffusion(self, user_embed, idx):
-        # Calculate betas (Steps, Batch, N_users)
+        # 1. 기초 통계량
         betas = self.get_batch_betas(user_embed, idx)
         alphas = 1.0 - betas
-
-        # Compute cumulative products
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-
-        # Padding for previous alpha (add 1 at the beginning)
-        # ones_tensor: (1, Batch, N_users)
-        ones_tensor = torch.ones((1, alphas.size(1), alphas.size(2)), device=self.device)
-        self.alphas_cumprod_prev = torch.cat([ones_tensor, self.alphas_cumprod[:-1]], dim=0)
-
-        # Precompute coefficients
-        # Note: All calculations remain on GPU
-        self.fast_posterior_coef2 = torch.sqrt(1.0 - self.alphas_cumprod_prev) / self.sqrt_one_minus_alphas_cumprod
-        self.fast_posterior_coef3 = (self.sqrt_alphas_cumprod * torch.sqrt(1.0 - self.alphas_cumprod_prev)) / self.sqrt_one_minus_alphas_cumprod
         
-        self.posterior_mean_coef1 = (betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod))
-        self.posterior_mean_coef2 = ((1.0 - self.alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - self.alphas_cumprod))
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
         
-        self.posterior_variance = (betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod))
+        # 필요한 파생 변수들 미리 계산
+        sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        
+        ones_tensor = torch.ones((1, alphas_cumprod.size(1), alphas_cumprod.size(2)), device=self.device)
+        alphas_cumprod_prev = torch.cat([ones_tensor, alphas_cumprod[:-1]], dim=0)
+
+        # 2. 계수 계산 (DDIM 및 일반 Sampling용)
+        # 계산 즉시 self에 할당하고, 중간 텐서는 참조를 끊습니다.
+        
+        self.fast_posterior_coef2 = torch.sqrt(1.0 - alphas_cumprod_prev) / sqrt_one_minus_alphas_cumprod
+        self.fast_posterior_coef3 = (sqrt_alphas_cumprod * torch.sqrt(1.0 - alphas_cumprod_prev)) / sqrt_one_minus_alphas_cumprod
+        
+        self.posterior_mean_coef1 = (betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
+        self.posterior_mean_coef2 = ((1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod))
+        
+        self.posterior_variance = (betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod))
+        
+        # 3. Sampling(q_sample)에서 쓰이는 변수 저장
+        self.sqrt_alphas_cumprod = sqrt_alphas_cumprod
+        self.sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod
+        self.alphas_cumprod = alphas_cumprod # SNR 계산용
+        self.alphas_cumprod_prev = alphas_cumprod_prev # p_mean_variance용
+
+        # 4. 메모리 정리
+        # betas, alphas 등 더 이상 안 쓰이는 중간 변수 삭제
+        del betas, alphas, sqrt_one_minus_alphas_cumprod, ones_tensor
+        # (주의: self에 할당된 것들은 지우면 안 됩니다)
 
     def training_losses(self, idx, x_start, all_embed, all_social_embed):
         # 1. 배치 데이터 및 확산 스케줄 계산
@@ -276,7 +287,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     
     num_rows = len(social_data)
     # [Optimization] Increase batch size significantly (e.g., 2048 or 4096)
-    batch_size = 4096 
+    batch_size = 2048 
     num_batches = (num_rows + batch_size - 1) // batch_size
     
     all_predictions = []
