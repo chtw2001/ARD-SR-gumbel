@@ -1,6 +1,6 @@
 
-
 import math
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,9 +34,13 @@ class MHCN(nn.Module):
         self.num_users, self.num_items= self.data.n_users,self.data.n_items
 
         # 재현성을 위한 seed 설정
-        if hasattr(args, 'seed'):
-            torch.manual_seed(args.seed)
-            np.random.seed(args.seed)
+        # if hasattr(args, 'seed'):
+        #     torch.manual_seed(args.seed)
+        #     np.random.seed(args.seed)
+        #     random.seed(args.seed)
+        #     if torch.cuda.is_available():
+        #         torch.cuda.manual_seed(args.seed)
+        #         torch.cuda.manual_seed_all(args.seed)
 
         self.init_channel()
 
@@ -250,18 +254,18 @@ class MHCN(nn.Module):
             all_embeddings_simple += [F.normalize(simple_user_embeddings, dim=1, p=2)]
             item_embeddings = new_item_embeddings
 
-        # averaging the channel-specific embeddings
-        user_embeddings_c1 = torch.mean(torch.stack(all_embeddings_c1,dim=0),dim=0)
-        user_embeddings_c2 = torch.mean(torch.stack(all_embeddings_c2,dim=0),dim=0)
-        user_embeddings_c3 = torch.mean(torch.stack(all_embeddings_c3,dim=0),dim=0)
-        simple_user_embeddings = torch.mean(torch.stack(all_embeddings_simple,dim=0), dim=0)
-        item_embeddings = torch.mean(torch.stack(all_embeddings_i,dim=0), dim=0)
+        # averaging the channel-specific embeddings (using sum like QRec implementation)
+        user_embeddings_c1 = torch.sum(torch.stack(all_embeddings_c1,dim=0),dim=0)
+        user_embeddings_c2 = torch.sum(torch.stack(all_embeddings_c2,dim=0),dim=0)
+        user_embeddings_c3 = torch.sum(torch.stack(all_embeddings_c3,dim=0),dim=0)
+        simple_user_embeddings = torch.sum(torch.stack(all_embeddings_simple,dim=0), dim=0)
+        item_embeddings = torch.sum(torch.stack(all_embeddings_i,dim=0), dim=0)
 
         # aggregating channel-specific embeddings
         final_item_embeddings = item_embeddings
         final_user_embeddings, attention_score = self.channel_attention(
             user_embeddings_c1, user_embeddings_c2, user_embeddings_c3)
-        final_user_embeddings= final_user_embeddings +simple_user_embeddings 
+        final_user_embeddings= final_user_embeddings + simple_user_embeddings/2.0 
 
         return final_user_embeddings, final_item_embeddings
     
@@ -289,14 +293,12 @@ class MHCN(nn.Module):
         neg2 = score(row_column_shuffle(edge_embeddings), user_embeddings)
         local_loss = torch.sum(-torch.log(torch.sigmoid(pos - neg1)) -
                                 torch.log(torch.sigmoid(neg1 - neg2)))
-        local_loss=local_loss/user_embeddings.size()[0]
 
         # Global MIN
         graph = torch.mean(edge_embeddings, dim=0)
         pos = score(edge_embeddings, graph)
         neg1 = score(row_column_shuffle(edge_embeddings), graph)
         global_loss = torch.sum(-torch.log(torch.sigmoid(pos - neg1)))
-        global_loss=global_loss/edge_embeddings.size()[0]
 
         return global_loss + local_loss
     
@@ -323,19 +325,20 @@ class MHCN(nn.Module):
         pos_emb = final_item_embeddings[v_idx,:]
         neg_emb = final_item_embeddings[neg_idx,:]
 
-        pos_scores = torch.mul(user_emb, pos_emb)
-        pos_scores = torch.sum(pos_scores, dim=1)
-        neg_scores = torch.mul(user_emb, neg_emb)
-        neg_scores = torch.sum(neg_scores, dim=1)
-        loss = torch.mean(torch.nn.functional.softplus(neg_scores - pos_scores))
+        # BPR Loss (QRec과 동일하게)
+        pos_scores = torch.sum(user_emb * pos_emb, dim=1)
+        neg_scores = torch.sum(user_emb * neg_emb, dim=1)
+        loss = -torch.sum(torch.log(torch.sigmoid(pos_scores - neg_scores) + 1e-8))
 
-        user0=self.user_embeddings(u_idx)
-        pos0=self.item_embeddings(v_idx)
-        neg0=self.item_embeddings(neg_idx)
-
-        reg_loss = (1/2)*(user0.norm(2).pow(2) + 
-                         pos0.norm(2).pow(2)  +
-                         neg0.norm(2).pow(2))/float(len(u_idx))
+        # Embedding 정규화 (QRec과 동일하게 전체 임베딩 행렬에 대해)
+        reg_loss = torch.norm(self.user_embeddings.weight, 2).pow(2) + torch.norm(self.item_embeddings.weight, 2).pow(2)
+        
+        # 가중치 정규화 (QRec과 동일)
+        weight_reg = 0.0
+        for key in self.weights:
+            weight_reg += 0.001 * torch.norm(self.weights[key], 2).pow(2)
+        
+        reg_loss = reg_loss + weight_reg
 
         return loss,reg_loss,ss_loss
 
@@ -366,4 +369,3 @@ class MHCN(nn.Module):
         embs = torch.stack(embs, dim=1)
         light_out = torch.mean(embs, dim=1)
         return light_out
-

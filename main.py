@@ -1,3 +1,9 @@
+import os
+# 환경 변수를 먼저 설정하여 결정적 동작 보장
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # cuBLAS 결정적 모드
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+
 import argparse, os, time, gc, wandb
 import numpy as np, scipy.sparse as sp
 import torch, torch.nn.functional as F
@@ -22,8 +28,8 @@ def train(args,log_path):
     
     if args.wandb:
         wandb.init(
-            project="ARD-SR-hyperparameter",
-            name=f"ARD-SR-{args.method}_{args.dataset}_{args.lr}",
+            project="ARD-SR-eval",
+            name=f"ARD-SR-{args.dataset}_batch-wise",
         )
     
     log_save_id = create_log_id(args.save_dir)
@@ -35,17 +41,28 @@ def train(args,log_path):
 
 
     data = SRDataLoader(args, logging)
-    train_loader = torch_data.DataLoader(data,batch_size=1024, shuffle=False, worker_init_fn=worker_init_fn)
+    # DataLoader에 seed 전달
+    train_loader = torch_data.DataLoader(
+        data, 
+        batch_size=8192,  # 배치 크기를 크게 설정
+        shuffle=False, 
+        num_workers=4,
+        worker_init_fn=worker_init_fn,
+        pin_memory=True,
+        generator=torch.Generator().manual_seed(args.seed),  # 추가 seed 설정
+        persistent_workers=True,  # worker 재사용으로 안정성 향상
+        drop_last=False  # 마지막 배치 보존
+    )
     original_social_data = sp.csr_matrix((np.ones_like(data.train_social_h_list), 
     (data.train_social_h_list, data.train_social_t_list)), dtype='float32', shape=(data.n_users, data.n_users))
     social_data = original_social_data.copy()
 
     ### Build SR and Diffusion Model ###
     # 모델 생성 전 seed 재설정
-    set_seed(args.seed)
+    set_seed(args.seed, args.gpu_id)
     
     model = MHCN(data,args).to(device)
-    rec_optimizer  = optim.Adam(model.parameters(), lr=0.001)
+    rec_optimizer  = optim.Adam(model.parameters(), lr=0.00005)
 
     if args.method == "gumbel":
         r, c = original_social_data.nonzero()
@@ -55,28 +72,43 @@ def train(args,log_path):
         new_social, ce_prev = None, None
         A_target   = torch.FloatTensor(social_data.A).to(device)  # EMA target
         train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
-        cur_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn)
+        cur_loader = torch_data.DataLoader(
+            train_social_dataset, 
+            batch_size=args.line_batch,
+            shuffle=False, 
+            num_workers=4,
+            worker_init_fn=worker_init_fn,
+            pin_memory=True,
+            generator=torch.Generator().manual_seed(args.seed),
+            persistent_workers=True,
+            drop_last=False
+        )
     elif args.method == "original":
         train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
-        diffusion_train_loader = torch_data.DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn)
+        diffusion_train_loader = torch_data.DataLoader(
+            train_social_dataset, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            num_workers=4,
+            worker_init_fn=worker_init_fn,
+            pin_memory=True,
+            generator=torch.Generator().manual_seed(args.seed),
+            persistent_workers=True,
+            drop_last=False
+        )
         new_score=social_data.A
         diffusion = ARDSR(data,args).to(device)
         diffusion_optimizer = optim.Adam(diffusion.parameters(),lr=args.lr)
         del_threshold = 0.6
         
     # 모델 생성 후 seed 재설정하여 완벽한 재현성 보장
-    set_seed(args.seed)
+    set_seed(args.seed, args.gpu_id)
         
-    del original_social_data
-    torch.cuda.empty_cache()
-    gc.collect()
     print("Start training...")
     best_recall, best_epoch = -100, 0
     diffusion_epoch=0
     for epoch in range(1, args.epochs + 1):
-        train_loader.dataset.ng_sample()
-        torch.cuda.empty_cache()
-        gc.collect()
+        # train_loader.dataset.ng_sample()
         
         if epoch - best_epoch >= args.stopping_steps:
             print('-'*18)
@@ -98,9 +130,6 @@ def train(args,log_path):
             loss.backward()
             rec_optimizer.step()
             
-            del batch_user, batch_pos_item, batch_neg_item, losses, loss
-            torch.cuda.empty_cache()
-            gc.collect()
             
         print('Backbone SR'+"Training Epoch {:03d} ".format(epoch) +'train loss {:.4f}'.format(total_loss) + " costs " + time.strftime(
                             "%H: %M: %S", time.gmtime(time.time()-start_time)))
@@ -108,8 +137,6 @@ def train(args,log_path):
         valid_results = evaluate(model,args,data,test=False)
         test_results = evaluate(model,args,data,test=True)
         print_results(None, valid_results, test_results)
-        torch.cuda.empty_cache()
-        gc.collect()
 
         if args.wandb:
             wandb.log({
@@ -223,8 +250,6 @@ def train(args,log_path):
                     _,graph,_= data.buildSocialAdjacency()
                     social_embed = model.get_social_embed(to_tensor(graph,args),all_embed_frozen)
                     social_embed_frozen = social_embed.clone()
-                torch.cuda.empty_cache()
-                gc.collect()
                     
                 diffusion.train()
                 diffusion_start_time = time.time()
@@ -241,6 +266,7 @@ def train(args,log_path):
                     diffusion_optimizer.step()
                     torch.cuda.empty_cache()
                     gc.collect()
+
                 print('Diffusion'+"Training Epoch{}".format(epoch)+'train loss {:.4f}'.format(total_diffusion_loss) + " costs " + time.strftime(
                                 "%H: %M: %S", time.gmtime(time.time()-diffusion_start_time)))
 
@@ -261,17 +287,16 @@ def train(args,log_path):
                     print("refine social net"+"Runing Epoch {:03d} ".format(epoch)  + " costs " + time.strftime(
                                 "%H: %M: %S", time.gmtime(time.time()-refine_start_time)))
                     del ce_for_1s
-                    torch.cuda.empty_cache()
-                    gc.collect()
+
                     if args.wandb:
                         wandb.log({
                             "epoch": epoch,
                             "Diffusion_train_loss": total_diffusion_loss
                             })
-                        
-                    
             torch.cuda.empty_cache()
             gc.collect()
+                    
+
         if valid_results[1][0] > best_recall: # Recall@10
             save_model(model, args.save_dir, epoch,best_epoch)
             best_recall, best_epoch = valid_results[1][0], epoch
@@ -307,28 +332,34 @@ def train(args,log_path):
     save_results(best_test_results,args.save_dir,ks)
 
 
-def set_seed(seed):
-    import numpy as np
+def set_seed(seed, gpu_id=None):
+    """Set seed for reproducibility"""
     import random
+    import numpy as np
     import torch
     import os
-
-    np.random.seed(seed)
+    
+    # Python, NumPy, PyTorch seed 설정
     random.seed(seed)
-    torch.manual_seed(seed) # cpu
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # gpu
+    torch.cuda.manual_seed_all(seed)
+    
+    # 결정적 알고리즘 사용
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.set_num_threads(4)
     
-    # # CUDA deterministic 설정 추가
-    if torch.cuda.is_available():
-        torch.cuda.deterministic = True
+    # CUDA 캐시 정리 및 지정된 GPU에만 seed 설정
+    if torch.cuda.is_available() and gpu_id is not None:
         torch.cuda.empty_cache()
-    torch.use_deterministic_algorithms(True)
+        # 지정된 GPU에만 seed 설정 (다른 GPU 초기화 방지)
+        torch.cuda.set_device(gpu_id)
+        torch.cuda.manual_seed(seed)
     
-    print(f"Set seed {seed}...")
+    print(f"Set seed {seed} for complete reproducibility...")
 
 
 def worker_init_fn(worker_id):
@@ -336,13 +367,27 @@ def worker_init_fn(worker_id):
     import numpy as np
     import random
     import torch
+    import os
     
-    worker_seed = torch.initial_seed() % 2**32
+    # 메인 프로세스의 seed를 기반으로 worker별 seed 생성
+    base_seed = torch.initial_seed()
+    worker_seed = (base_seed + worker_id) % 2**32
+    
+    # 각 worker에서 seed 설정
     np.random.seed(worker_seed)
     random.seed(worker_seed)
     torch.manual_seed(worker_seed)
-    torch.cuda.manual_seed(worker_seed)
-    torch.cuda.manual_seed_all(worker_seed)
+    
+    # PyTorch 백엔드 설정
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # CUDA seed 설정
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(worker_seed)
+        torch.cuda.manual_seed_all(worker_seed)
+    
+    print(f"Worker {worker_id} initialized with seed {worker_seed}")
 
 
 if __name__ == '__main__':
@@ -350,18 +395,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='lastfm')
     parser.add_argument('--data_path', type=str, default='datasets/')
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--stopping_steps', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=5000)
+    parser.add_argument('--stopping_steps', type=int, default=100)
     parser.add_argument('--topN', type=str, default='[10,20,50]')
     parser.add_argument('--device', nargs='?', default=3,type=int)  
     parser.add_argument('--seed', type=int, default=42)  
     parser.add_argument('--batch_size', type=int, default=64, help='batch size')
     
     # parameter for sr backbone
-    parser.add_argument('--n_layers', type=int, default=3)
+    parser.add_argument('--n_layers', type=int, default=2)
     parser.add_argument('--embed_dim', type=int, default=64)
-    parser.add_argument('--lambda1', nargs='?', default=0.01)
-    parser.add_argument('--lambda2', nargs='?', default=0.001,type=float)
+    parser.add_argument('--lambda1', nargs='?', default=0.001,type=float)
+    parser.add_argument('--lambda2', nargs='?', default=0.25,type=float)
     parser.add_argument('--ssl_temp', nargs='?', default=0.01)
     parser.add_argument('--neg', nargs='?', default=1000,type=int)
     parser.add_argument('--neg_num', nargs='?', default=1) 
@@ -370,12 +415,12 @@ if __name__ == '__main__':
     parser.add_argument('--pretrain_epochs', type=int, default=10) # backbone의 몇 epoch이후에 정제할지
     parser.add_argument('--line_period', type=int, default=5) # 몇 epoch 마다 정제할지
     parser.add_argument('--line_epochs', type=int, default=1) # 정제 과정에서 line 모듈을 몇 번 학습시킬지, diffusion은 step이 많으니까 얘도 2이상으로 설정할 수 있게 세팅
-    parser.add_argument('--cos_s', type=float, default=0.75)
-    parser.add_argument('--gumbel_temp', type=float, default=0.2)
-    parser.add_argument('--alpha', type=float, default=0.7) # EMA 계수
+    parser.add_argument('--cos_s', type=float, default=0.3)
+    parser.add_argument('--gumbel_temp', type=float, default=0.4)
+    parser.add_argument('--alpha', type=float, default=0.5) # EMA 계수
     parser.add_argument('--line_max_ep', type=int, default=5) # curriculum learning의 최대 epoch 수
     parser.add_argument('--line_init_prop', type=int, default=0.4) # curriculum learning의 초기 샘플 비율
-    parser.add_argument('--line_batch', type=int, default=1024) # line의 batch size
+    parser.add_argument('--line_batch', type=int, default=16) # line의 batch size
     parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 
 
@@ -409,18 +454,18 @@ if __name__ == '__main__':
                 if hasattr(args, key):
                     setattr(args, key, value)
                     
-        if args.noise_max < args.noise_min:
-            print(f"[WARNING] Invalid config: noise_max({args.noise_max}) < noise_min({args.noise_min})")
-            wandb.init(name="INVALID_CONFIG_SKIP")
-            quit()
+        # if args.noise_max < args.noise_min:
+        #     print(f"[WARNING] Invalid config: noise_max({args.noise_max}) < noise_min({args.noise_min})")
+        #     wandb.init(name="INVALID_CONFIG_SKIP")
+        #     quit()
         
-        diff = args.noise_max - args.noise_min
-        if args.noise_scale > diff:
-            print(f"[WARNING] Invalid config: noise_scale({args.noise_scale}) > (noise_max - noise_min)={diff}")
-            wandb.init(name="INVALID_CONFIG_SKIP")
-            quit()
+        # diff = args.noise_max - args.noise_min
+        # if args.noise_scale > diff:
+        #     print(f"[WARNING] Invalid config: noise_scale({args.noise_scale}) > (noise_max - noise_min)={diff}")
+        #     wandb.init(name="INVALID_CONFIG_SKIP")
+        #     quit()
             
-    set_seed(args.seed)
+    set_seed(args.seed, args.gpu_id)
 
     from datetime import datetime
     now = datetime.now().strftime('%y_%m_%d_%H_%M')

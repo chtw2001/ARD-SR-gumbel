@@ -1,0 +1,42 @@
+method: grid
+project: ARD-SR-eval
+program: main.py
+parameters:
+  dataset:
+    values: ["filmtrust"] # "ciao", "yelp", "filmtrust", "lastfm", "douban"
+  
+  lr:
+    values: [1e-3] 
+  gpu_id:
+    value: 0
+  wandb:
+    value: True
+  topN:
+    value: "[10,20,50]"
+  method:
+    value: "original"
+
+  stopping_steps:
+    values: [200]
+  temp:
+    values: [0.5]
+  steps:
+    values: [50] #, 200]
+  noise_scale:
+    values: [1e-2] # , 1e-3]
+  noise_min:
+    values: [1e-2] # , 1e-4]
+  noise_max:
+    values: [1e-1] # , 1e-2]
+
+  seed:
+    values: [42, 1004, 2025]
+
+
+  # gumbel_temp:
+  #   values: [0.4]
+  # cos_s:
+  #   values: [0.75]
+  # alpha:
+  #   values: [0.5]
+
