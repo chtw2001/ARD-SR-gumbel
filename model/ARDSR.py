@@ -395,3 +395,18 @@ def flip_tensor(batch, cos_similarities, seed):
     flipped_batch = torch.where(should_flip, 1 - batch, batch)
     
     return flipped_batch
+
+
+def to_tensor(coo_mat, args):
+    """
+    Scipy COO matrix를 PyTorch Sparse Tensor로 변환하는 함수
+    """
+    values = coo_mat.data
+    indices = np.vstack((coo_mat.row, coo_mat.col))
+
+    i = torch.tensor(indices, dtype=torch.long)
+    v = torch.tensor(values, dtype=torch.float32)
+    
+    # torch.sparse_coo_tensor가 더 권장되는 방식입니다.
+    # 생성과 동시에 device로 이동합니다.
+    return torch.sparse_coo_tensor(i, v, coo_mat.shape, device=args.device)
