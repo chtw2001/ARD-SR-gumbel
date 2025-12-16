@@ -3,12 +3,12 @@ project: ARD-SR-eval
 program: main.py
 parameters:
   dataset:
-    values: ["yelp"] # , "ciao"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
+    values: ["epinions"] # , "ciao"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
   
   lr:
     values: [1e-3] 
   gpu_id:
-    value: 1
+    value: 0
   wandb:
     value: True
   topN:
@@ -21,7 +21,7 @@ parameters:
   temp:
     values: [3]
   steps:
-    values: [50] #, 200]
+    values: [10] #, 200]
   noise_scale:
     values: [1e-2] # , 1e-3]
   noise_min:
@@ -30,7 +30,7 @@ parameters:
     values: [1e-2] # , 1e-2]
 
   seed:
-    values: [2025]
+    values: [42, 1004, 2025]
 
 
   gumbel_temp:
