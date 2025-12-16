@@ -110,8 +110,7 @@ class ARDSR(nn.Module):
         self.posterior_variance = (betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod))
 
     def training_losses(self, idx, x_start, all_embed, all_social_embed):
-        # [Optimization] Remove GC calls inside training loop
-        
+        # 1. 배치 데이터 및 확산 스케줄 계산
         self.calculate_batch_for_diffusion(all_embed, idx)
         
         batch_size = x_start.size(0)
@@ -123,7 +122,7 @@ class ARDSR(nn.Module):
         user_embed = all_embed[idx, :]
         social_embed = all_social_embed[idx, :]
 
-        # Optimized input calculation
+        # 2. Input 계산 최적화
         combined_embed = torch.sigmoid(self.input_trans(user_embed * social_embed))
         input_feats = combined_embed * user_embed
 
@@ -131,15 +130,24 @@ class ARDSR(nn.Module):
 
         loss = (x_start - model_output) ** 2
         
-        # SNR Weighting
+        # 3. SNR Weighting 계산
         weight = self.SNR(ts - 1) - self.SNR(ts)
-        # Apply mask for t=0
-        weight = torch.where(ts == 0, torch.tensor(1.0, device=self.device), weight)
         
-        # Expand weight for broadcasting: (Batch,) -> (Batch, 1) -> (Batch, N_users)
-        weight = weight.view(-1, 1) 
+        # --- [수정된 부분] ---
+        # ts == 0 조건을 (Batch, 1) 형태로 바꿔주어 브로드캐스팅이 가능하게 합니다.
+        ts_mask = (ts == 0).view(-1, 1)  # (Batch,) -> (Batch, 1)
         
-        # Mean over users
+        # torch.tensor(1.0)도 device를 맞춰줍니다.
+        ones = torch.tensor(1.0, device=self.device)
+        
+        # 이제 ts_mask(64,1)와 weight(64,21991)의 차원이 호환됩니다.
+        weight = torch.where(ts_mask, ones, weight)
+        # ---------------------
+        
+        # 기존: weight는 이미 (Batch, N_users) 형태이므로 view(-1,1) 불필요
+        # weight = weight.view(-1, 1) # 이 줄은 삭제하거나 주석 처리 (이미 위에서 (Batch, N_users) 형태임)
+        
+        # 평균 계산
         terms_loss = torch.mean(weight * loss, dim=1)
         terms_loss /= pt
 
