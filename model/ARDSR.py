@@ -187,20 +187,23 @@ class ARDSR(nn.Module):
         return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
 
     def p_mean_variance(self, x, t, batch_embed):
-        # t is a scalar here (current timestep for the whole batch)
-        # In inference loop, t is usually constant across batch for synchronized sampling
+        # t는 여기서 정수(int) 값으로 들어옵니다 (Loop에서 i를 넘겨줌)
         
-        # Extract based on scalar t
-        # Variance is (Steps, Batch, N_users) -> (Batch, N_users)
+        # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
         model_variance = self.posterior_variance[t] 
 
-        model_output = self.MLP(x, batch_embed, t.repeat(x.size(0)))
+        # 2. MLP 입력용 Timestep 텐서 생성 [수정된 부분]
+        # 정수 t를 사용하여 (Batch_Size,) 크기의 텐서를 만듭니다.
+        # 기존: t.repeat(x.size(0)) -> 에러 원인 (int에는 repeat가 없음)
+        t_batch = torch.full((x.size(0),), t, device=self.device, dtype=torch.long)
+
+        # 3. 모델 예측
+        model_output = self.MLP(x, batch_embed, t_batch)
 
         pred_xstart = model_output
         
-        # Use simple indexing since t is scalar integer in loop
+        # 정수 t를 사용하여 계수(Coefficient) 추출
         if not self.ddim:
-            # posterior mean calculation
             coef1 = self.posterior_mean_coef1[t]
             coef2 = self.posterior_mean_coef2[t]
             model_mean = coef1 * pred_xstart + coef2 * x
