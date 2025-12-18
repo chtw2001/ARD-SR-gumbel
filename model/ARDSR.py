@@ -43,6 +43,7 @@ class ARDSR(nn.Module):
 
         # Pre-calculate base variance
         self.variance_base = self.get_base_betas()
+        self.cached_step_lookup = None
 
     def _set_seed(self, seed):
         torch.manual_seed(seed)
@@ -58,7 +59,7 @@ class ARDSR(nn.Module):
             variance_base[0] = 1e-5
         return variance_base
 
-    def get_batch_betas(self, user_embed, idx):
+    def get_batch_betas(self, user_embed, idx, expand_steps=True):
         # [Optimization] Matrix Multiplication for Cosine Similarity
         # A: (Batch, Dim), B: (N_users, Dim) -> Result: (Batch, N_users)
         
@@ -73,60 +74,146 @@ class ARDSR(nn.Module):
         gamma1 = cos_similarities
         gamma2 = 1 - 0.01 * torch.exp(self.temp * gamma1) # (Batch, N_users)
         
+        if not expand_steps:
+            return gamma2
+
         # Expand variance_base: (Steps) -> (Steps, 1, 1)
         var_base_view = self.variance_base.view(-1, 1, 1)
-        
+
         # Expand gamma2: (Batch, N_users) -> (1, Batch, N_users)
         gamma2_view = gamma2.unsqueeze(0)
-        
+
         # Broadcasting handles the rest: (Steps, Batch, N_users)
         score = gamma2_view * var_base_view
-        
+
         return score
 
-    def calculate_batch_for_diffusion(self, user_embed, idx):
-        # 1. 기초 통계량
-        betas = self.get_batch_betas(user_embed, idx)
-        alphas = 1.0 - betas
-        
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        
-        # 필요한 파생 변수들 미리 계산
+    def _map_cached_steps(self, t):
+        if self.cached_step_lookup is None:
+            return t
+
+        if isinstance(t, int):
+            t_tensor = torch.tensor([t], device=self.cached_step_lookup.device)
+            mapped = self.cached_step_lookup[t_tensor][0].item()
+            if mapped < 0:
+                raise IndexError(f"Timestep {t} not cached for diffusion schedule")
+            return mapped
+
+        mapped = self.cached_step_lookup[t]
+        if (mapped < 0).any():
+            missing = t[mapped < 0]
+            raise IndexError(f"Timesteps {missing.tolist()} not cached for diffusion schedule")
+        return mapped
+
+    def calculate_batch_for_diffusion(self, user_embed, idx, selected_steps=None):
+        """
+        Calculate diffusion statistics for a given batch.
+
+        When ``selected_steps`` is provided, only the timesteps that will
+        actually be used (and their previous steps) are cached. This avoids
+        allocating a full (steps x batch x n_users) tensor, which was the
+        major VRAM spike on large datasets such as Epinions when ``steps`` is
+        50.
+        """
+
+        gamma2 = self.get_batch_betas(user_embed, idx, expand_steps=False)
+
+        # Track which steps must be materialized. For training we only need
+        # the sampled timesteps (and their predecessors for SNR weighting).
+        if selected_steps is not None:
+            selected_steps = selected_steps.detach()
+            needed = torch.unique(torch.cat([
+                selected_steps,
+                torch.clamp(selected_steps - 1, min=0)
+            ])).tolist()
+        else:
+            needed = list(range(self.steps))
+
+        max_needed = max(needed)
+
+        # Estimate cache size (we store ~4 tensors of this shape). If the
+        # estimate exceeds ~1.5GB, fall back to CPU caching to avoid GPU OOM
+        # during large-batch inference on datasets like Epinions.
+        cache_dtype = torch.float16 if gamma2.dtype == torch.float32 else gamma2.dtype
+        element_size = torch.tensor([], dtype=cache_dtype).element_size()
+        est_bytes = len(needed) * gamma2.numel() * element_size * 4
+        cache_device = self.device
+        if selected_steps is None and est_bytes > 1.5 * 1024 ** 3:
+            cache_device = torch.device("cpu")
+
+        # Keep variance_base on the computation device for beta_t calculation.
+        variance_base = self.variance_base.to(gamma2.device)
+
+        # Start with alpha_cumprod = 1 for every user in the batch.
+        alpha_cumprod = torch.ones(
+            (gamma2.size(0), gamma2.size(1)), device=gamma2.device, dtype=gamma2.dtype
+        )
+
+        cached_steps = []
+        cached_alpha = []
+        cached_prev = []
+        cached_beta = []
+
+        for step in range(max_needed + 1):
+            beta_t = gamma2 * variance_base[step]
+            alpha_t = 1.0 - beta_t
+
+            if step in needed:
+                prev = alpha_cumprod
+                alpha_cumprod = alpha_cumprod * alpha_t
+
+                cached_steps.append(step)
+                cached_beta.append(beta_t.to(cache_device, dtype=cache_dtype))
+                cached_prev.append(prev.to(cache_device, dtype=cache_dtype))
+                cached_alpha.append(alpha_cumprod.to(cache_device, dtype=cache_dtype))
+            else:
+                alpha_cumprod = alpha_cumprod * alpha_t
+
+        # Stack cached tensors back to (len(needed), batch, n_users)
+        alphas_cumprod = torch.stack(cached_alpha, dim=0)
+        alphas_cumprod_prev = torch.stack(cached_prev, dim=0)
+
         sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
         sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-        
-        ones_tensor = torch.ones((1, alphas_cumprod.size(1), alphas_cumprod.size(2)), device=self.device)
-        alphas_cumprod_prev = torch.cat([ones_tensor, alphas_cumprod[:-1]], dim=0)
 
-        # 2. 계수 계산 (DDIM 및 일반 Sampling용)
-        # 계산 즉시 self에 할당하고, 중간 텐서는 참조를 끊습니다.
-        
-        self.fast_posterior_coef2 = torch.sqrt(1.0 - alphas_cumprod_prev) / sqrt_one_minus_alphas_cumprod
-        self.fast_posterior_coef3 = (sqrt_alphas_cumprod * torch.sqrt(1.0 - alphas_cumprod_prev)) / sqrt_one_minus_alphas_cumprod
-        
-        self.posterior_mean_coef1 = (betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod))
-        self.posterior_mean_coef2 = ((1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod))
-        
-        self.posterior_variance = (betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod))
-        
-        # 3. Sampling(q_sample)에서 쓰이는 변수 저장
+        # Build a lookup tensor so we can map the original timestep to the
+        # cached slice without keeping the full schedule in memory.
+        step_lookup = torch.full((self.steps,), -1, device=self.device, dtype=torch.long)
+        for i, s in enumerate(cached_steps):
+            step_lookup[s] = i
+
+        # Store cached schedules
+        self.cached_step_lookup = step_lookup
+        self.cache_device = cache_device
         self.sqrt_alphas_cumprod = sqrt_alphas_cumprod
         self.sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod
-        self.alphas_cumprod = alphas_cumprod # SNR 계산용
-        self.alphas_cumprod_prev = alphas_cumprod_prev # p_mean_variance용
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas_cumprod_prev = alphas_cumprod_prev
 
-        # 4. 메모리 정리
-        # betas, alphas 등 더 이상 안 쓰이는 중간 변수 삭제
-        del betas, alphas, sqrt_one_minus_alphas_cumprod, ones_tensor
-        # (주의: self에 할당된 것들은 지우면 안 됩니다)
+        # The posterior coefficients are only required for p_mean_variance
+        # during sampling. When we restrict to a subset of timesteps we still
+        # build the matching cached slices.
+        cached_beta = torch.stack(cached_beta, dim=0)
+
+        self.fast_posterior_coef2 = torch.sqrt(1.0 - alphas_cumprod_prev) / sqrt_one_minus_alphas_cumprod
+        self.fast_posterior_coef3 = (sqrt_alphas_cumprod * torch.sqrt(1.0 - alphas_cumprod_prev)) / sqrt_one_minus_alphas_cumprod
+
+        denom = (1.0 - alphas_cumprod).clamp(min=1e-12)
+        self.posterior_mean_coef1 = (cached_beta * torch.sqrt(alphas_cumprod_prev) / denom)
+        self.posterior_mean_coef2 = ((1.0 - alphas_cumprod_prev) * torch.sqrt(1.0 - cached_beta) / denom)
+
+        self.posterior_variance = (cached_beta * (1.0 - alphas_cumprod_prev) / denom)
+
+        # Cleanup intermediate tensors we no longer need
+        del gamma2, alpha_cumprod, cached_alpha, cached_prev, cached_beta
 
     def training_losses(self, idx, x_start, all_embed, all_social_embed):
-        # 1. 배치 데이터 및 확산 스케줄 계산
-        self.calculate_batch_for_diffusion(all_embed, idx)
-        
         batch_size = x_start.size(0)
         ts, pt = self.sample_timesteps(batch_size, x_start.device)
-        
+
+        # 1. 배치 데이터 및 확산 스케줄 계산 (필요한 스텝만 캐싱)
+        self.calculate_batch_for_diffusion(all_embed, idx, selected_steps=ts)
+
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, ts, noise)
 
@@ -168,16 +255,27 @@ class ARDSR(nn.Module):
         # Improved extraction logic
         # t is (Batch,), alphas_cumprod is (Steps, Batch, N_users)
         # We need to gather the alpha for each batch item at its specific timestep
-        
+
         # Gather logic: select [t[b], b, :] for all b
         # Optimized extract using gather/indexing
         # alphas: (Steps, Batch, N_users) -> Select step t for each batch
-        
+
         # Create indices for gathering
         batch_indices = torch.arange(t.size(0), device=t.device)
+
+        # Clamp to the earliest cached step to avoid negative lookups when
+        # callers request t-1 for t == 0. The cached schedule always includes
+        # step 0, so this preserves valid indexing while preventing
+        # IndexError from _map_cached_steps.
+        t_idx = self._map_cached_steps(torch.clamp(t, min=0))
         # Indexing: alphas[t, batch_indices, :]
-        alpha_t = self.alphas_cumprod[t, batch_indices, :]
-        
+        if self.alphas_cumprod.device != t_idx.device:
+            t_idx = t_idx.to(self.alphas_cumprod.device)
+            batch_indices = batch_indices.to(self.alphas_cumprod.device)
+        alpha_t = self.alphas_cumprod[t_idx, batch_indices, :]
+        if alpha_t.device != t.device:
+            alpha_t = alpha_t.to(t.device)
+
         return alpha_t / (1 - alpha_t)
 
     def sample_timesteps(self, batch_size, device):
@@ -188,20 +286,35 @@ class ARDSR(nn.Module):
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
-            
+
         # Efficient extraction
         batch_indices = torch.arange(t.size(0), device=t.device)
-        
-        sqrt_alphas = self.sqrt_alphas_cumprod[t, batch_indices, :]
-        sqrt_one_minus_alphas = self.sqrt_one_minus_alphas_cumprod[t, batch_indices, :]
-        
+
+        t_idx = self._map_cached_steps(t)
+        cache_device = self.sqrt_alphas_cumprod.device
+        if cache_device != t_idx.device:
+            t_idx = t_idx.to(cache_device)
+            batch_indices = batch_indices.to(cache_device)
+
+        sqrt_alphas = self.sqrt_alphas_cumprod[t_idx, batch_indices, :]
+        sqrt_one_minus_alphas = self.sqrt_one_minus_alphas_cumprod[t_idx, batch_indices, :]
+
+        if sqrt_alphas.device != x_start.device:
+            sqrt_alphas = sqrt_alphas.to(x_start.device)
+            sqrt_one_minus_alphas = sqrt_one_minus_alphas.to(x_start.device)
+
         return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
 
     def p_mean_variance(self, x, t, batch_embed):
         # t는 여기서 정수(int) 값으로 들어옵니다 (Loop에서 i를 넘겨줌)
-        
+
+        mapped_t = self._map_cached_steps(t)
+
         # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
-        model_variance = self.posterior_variance[t] 
+        coef_device = self.posterior_variance.device
+        if coef_device != mapped_t.device:
+            mapped_t = mapped_t.to(coef_device)
+        model_variance = self.posterior_variance[mapped_t]
 
         # 2. MLP 입력용 Timestep 텐서 생성 [수정된 부분]
         # 정수 t를 사용하여 (Batch_Size,) 크기의 텐서를 만듭니다.
@@ -214,14 +327,25 @@ class ARDSR(nn.Module):
         pred_xstart = model_output
         
         # 정수 t를 사용하여 계수(Coefficient) 추출
+        if model_variance.device != x.device:
+            # Move all cached slices required for this step to the current device
+            model_variance = model_variance.to(x.device)
+
         if not self.ddim:
-            coef1 = self.posterior_mean_coef1[t]
-            coef2 = self.posterior_mean_coef2[t]
+            coef1 = self.posterior_mean_coef1[mapped_t]
+            coef2 = self.posterior_mean_coef2[mapped_t]
+            if coef1.device != x.device:
+                coef1 = coef1.to(x.device)
+                coef2 = coef2.to(x.device)
             model_mean = coef1 * pred_xstart + coef2 * x
         else:
-            sqrt_alpha_prev = torch.sqrt(self.alphas_cumprod_prev[t])
-            coef2 = self.fast_posterior_coef2[t]
-            coef3 = self.fast_posterior_coef3[t]
+            sqrt_alpha_prev = torch.sqrt(self.alphas_cumprod_prev[mapped_t])
+            coef2 = self.fast_posterior_coef2[mapped_t]
+            coef3 = self.fast_posterior_coef3[mapped_t]
+            if sqrt_alpha_prev.device != x.device:
+                sqrt_alpha_prev = sqrt_alpha_prev.to(x.device)
+                coef2 = coef2.to(x.device)
+                coef3 = coef3.to(x.device)
             model_mean = sqrt_alpha_prev * pred_xstart + coef2 * x - coef3 * pred_xstart
 
         return {"mean": model_mean, "variance": model_variance, "log_variance": torch.log(model_variance.clamp(min=1e-20))}
@@ -235,11 +359,11 @@ class ARDSR(nn.Module):
         else:
             # t_tensor = torch.full((x_start.size(0),), noise_step - 1, device=x_start.device, dtype=torch.long)
             # Use q_sample directly
-            # For inference, q_sample expects t as a batch of indices. 
+            # For inference, q_sample expects t as a batch of indices.
             # But here let's simplify: usually we start from pure noise for generation, or noisy input for refinement.
             # Re-using q_sample logic requires proper t tensor
-             t_tensor = torch.tensor([noise_step - 1] * x_start.shape[0], device=x_start.device).long()
-             x_t = self.q_sample(x_start, t_tensor)
+            t_tensor = torch.tensor([noise_step - 1] * x_start.shape[0], device=x_start.device).long()
+            x_t = self.q_sample(x_start, t_tensor)
 
         reverse_step = steps // 10 if self.ddim else steps
         indices = list(range(reverse_step))[::-1]
