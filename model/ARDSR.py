@@ -5,6 +5,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 import random
 import os
+import tempfile
+import time
 from .DNN import DNN
 
 class ARDSR(nn.Module):
@@ -428,11 +430,19 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     all_embed_norm = F.normalize(all_embed, p=2, dim=1)
     
     num_rows = len(social_data)
+    num_cols = social_data.shape[1]
     # [Optimization] Increase batch size significantly (e.g., 2048 or 4096)
-    batch_size = 2048 
+    batch_size = 1024 if num_cols > 5000 else 2048
     num_batches = (num_rows + batch_size - 1) // batch_size
-    
-    all_predictions = []
+
+    # Stream predictions to a disk-backed memmap to avoid keeping a full
+    # dense score matrix in RAM. Using float16 halves the footprint.
+    tmp_dir = getattr(args, "tmp_dir", None) or tempfile.gettempdir()
+    mmap_path = os.path.join(
+        tmp_dir,
+        f"new_score_{os.getpid()}_{int(time.time())}.mmap",
+    )
+    new_score_mm = np.memmap(mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols))
     
     # Pre-move static large tensors to GPU if VRAM allows, otherwise keep on CPU and slice
     # Assuming social_data and score fit in memory but we slice them
@@ -446,8 +456,8 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             # Keeping inputs on CPU until batching is usually better for very large datasets
             idx_tensor = torch.arange(start, end, device=args.device)
             
-            batch_social = torch.tensor(social_data[start:end], dtype=torch.float32, device=args.device)
-            batch_score = torch.tensor(score[start:end], dtype=torch.float32, device=args.device)
+            batch_social = torch.tensor(social_data[start:end], dtype=torch.float16, device=args.device)
+            batch_score = torch.tensor(score[start:end], dtype=torch.float16, device=args.device)
             
             if flip:
                 # Compute Cosine Similarity on the fly: (Batch, N)
@@ -463,11 +473,13 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             prediction = torch.sigmoid(prediction)
             avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
             
-            # Move to CPU immediately to free GPU memory for next batch
-            all_predictions.append(avg_prediction.cpu())
-            
-    # Concatenate all results
-    new_score = torch.cat(all_predictions, dim=0) # (Total_Users, N_items/users)
+            # Move to CPU immediately to free GPU memory for next batch and
+            # write into the memmap slice.
+            new_score_mm[start:end] = avg_prediction.detach().to("cpu", dtype=torch.float16).numpy()
+
+    # Ensure data is flushed to disk before any CPU reads
+    new_score_mm.flush()
+    new_score_cpu = new_score_mm
     
     # [Optimization] GPU-based Top-K and Filtering
     # Moving logic from CPU list comprehension to Torch operations
@@ -475,19 +487,17 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     # 1. Identify Edges to Delete / Add (chunked on CPU to avoid huge flatten top-k)
     # Keep heavy masking and top-k selection on CPU to limit GPU time and memory
     # when the adjacency matrix is large and steps are high (e.g., steps=100).
-    new_score_cpu = new_score if not new_score.is_cuda else new_score.cpu()
     social_cpu = torch.as_tensor(social_data, device="cpu") if not torch.is_tensor(social_data) else social_data.cpu()
 
     h_list = []
     t_list = []
 
-    num_cols = new_score_cpu.size(1)
     chunk = 512  # smaller chunks reduce per-iteration overhead on very large graphs
     decay = False
 
     for start in range(0, num_rows, chunk):
         end = min(start + chunk, num_rows)
-        score_chunk = new_score_cpu[start:end]
+        score_chunk = torch.from_numpy(new_score_cpu[start:end]).float()
         social_chunk = social_cpu[start:end]
 
         # Existing edges and scores for the current chunk
@@ -526,7 +536,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                     h_list.extend([row_idx + start] * selected_cols.numel())
                     t_list.extend(selected_cols.tolist())
 
-    return h_list, t_list, new_score_cpu.numpy(), decay
+    return h_list, t_list, new_score_cpu, decay
 
 
 def flip_tensor(batch, cos_similarities, seed):
