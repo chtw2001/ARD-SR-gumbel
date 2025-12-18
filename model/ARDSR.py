@@ -472,72 +472,62 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     # [Optimization] GPU-based Top-K and Filtering
     # Moving logic from CPU list comprehension to Torch operations
     
-    # 1. Identify Edges to Delete
-    # social_data is scipy sparse or numpy array? Assuming numpy dense based on code usage
-    social_data_tensor = torch.tensor(social_data, device=args.device) if not torch.is_tensor(social_data) else social_data
-    new_score_device = new_score.to(args.device)
-    
-    # Mask of existing edges
-    existing_mask = (social_data_tensor != 0)
-    existing_scores = new_score_device[existing_mask]
-    
-    # Find edges below threshold
-    # Get indices of existing edges
-    existing_indices = torch.nonzero(existing_mask, as_tuple=False) # (N_edges, 2)
-    
-    # Filter by score
-    scores_on_edges = new_score_device[existing_indices[:, 0], existing_indices[:, 1]]
-    under_threshold_mask = scores_on_edges < del_threshold
-    
-    edges_to_delete_indices = existing_indices[under_threshold_mask]
-    edges_to_delete_scores = scores_on_edges[under_threshold_mask]
-    
-    # Limit deletions (max 1% of edges)
-    num_existing = existing_indices.size(0)
-    max_deletions = int(num_existing * 0.01)
-    
-    if edges_to_delete_indices.size(0) > max_deletions:
-        # Sort by score ascending to delete lowest scores first
-        _, sorted_idx = torch.sort(edges_to_delete_scores)
-        edges_to_delete_indices = edges_to_delete_indices[sorted_idx[:max_deletions]]
-    
-    # Create the base remaining edges (on GPU)
-    # We can create a mask to remove deleted edges
-    final_mask = existing_mask.clone()
-    final_mask[edges_to_delete_indices[:, 0], edges_to_delete_indices[:, 1]] = 0
-    
-    # 2. Identify Edges to Add
-    # Flatten scores to find global top-k, EXCLUDING existing edges
-    # To exclude existing, set their score to -infinity temporarily
-    temp_scores = new_score_device.clone()
-    # Mask out existing edges so we don't re-add them (or keep them via final_mask)
-    # Actually, we want to add *new* edges.
-    temp_scores[existing_mask] = -float('inf') 
-    
-    num_to_add = edges_to_delete_indices.size(0)
-    
-    if num_to_add > 0:
-        # Get global top k
-        # Flatten
-        flat_scores = temp_scores.view(-1)
-        _, top_k_indices = torch.topk(flat_scores, num_to_add)
-        
-        # Convert flat indices back to 2D
-        rows_to_add = top_k_indices // new_score.shape[1]
-        cols_to_add = top_k_indices % new_score.shape[1]
-        
-        # Update final mask
-        final_mask[rows_to_add, cols_to_add] = 1
-        
-    # 3. Convert final mask to h_list, t_list (if strictly needed for downstream)
-    # or return sparse tensor / adjacency matrix
-    final_edges = torch.nonzero(final_mask, as_tuple=False)
-    h_list = final_edges[:, 0].tolist()
-    t_list = final_edges[:, 1].tolist()
-    
-    decay = edges_to_delete_indices.size(0) > 0 # Simplified logic
-    
-    return h_list, t_list, new_score.numpy(), decay
+    # 1. Identify Edges to Delete / Add (chunked on CPU to avoid huge flatten top-k)
+    # Keep heavy masking and top-k selection on CPU to limit GPU time and memory
+    # when the adjacency matrix is large and steps are high (e.g., steps=100).
+    new_score_cpu = new_score if not new_score.is_cuda else new_score.cpu()
+    social_cpu = torch.as_tensor(social_data, device="cpu") if not torch.is_tensor(social_data) else social_data.cpu()
+
+    h_list = []
+    t_list = []
+
+    num_cols = new_score_cpu.size(1)
+    chunk = 512  # smaller chunks reduce per-iteration overhead on very large graphs
+    decay = False
+
+    for start in range(0, num_rows, chunk):
+        end = min(start + chunk, num_rows)
+        score_chunk = new_score_cpu[start:end]
+        social_chunk = social_cpu[start:end]
+
+        # Existing edges and scores for the current chunk
+        existing_mask = social_chunk != 0
+        if existing_mask.sum() == 0:
+            continue
+
+        rows, cols = torch.nonzero(existing_mask, as_tuple=True)
+        scores_on_edges = score_chunk[rows, cols]
+        under_mask = scores_on_edges < del_threshold
+
+        if under_mask.any():
+            decay = True
+            del_rows = rows[under_mask]
+            del_cols = cols[under_mask]
+
+            # Track deletions
+            h_list.extend((del_rows + start).tolist())
+            t_list.extend(del_cols.tolist())
+
+            # Determine how many additions per row (match deletions per row)
+            del_counts = torch.bincount(del_rows, minlength=score_chunk.size(0))
+
+            for local_row in del_counts.nonzero(as_tuple=False).flatten():
+                k = del_counts[local_row].item()
+                if k == 0:
+                    continue
+                row_idx = local_row.item()
+                row_scores = score_chunk[row_idx]
+                # Mask out existing edges to avoid re-adding them
+                masked_row = row_scores.masked_fill(existing_mask[row_idx], -float("inf"))
+                topk_vals, topk_idx = torch.topk(masked_row, min(k, num_cols))
+                valid = torch.isfinite(topk_vals)
+                if valid.any():
+                    selected_cols = topk_idx[valid]
+                    h_list.extend([row_idx + start] * selected_cols.numel())
+                    t_list.extend(selected_cols.tolist())
+
+    return h_list, t_list, new_score_cpu.numpy(), decay
+
 
 def flip_tensor(batch, cos_similarities, seed):
     # Optimized flip without repeated manual seeding inside batch ops if not strictly necessary

@@ -271,7 +271,7 @@ def train(args,log_path):
                                 "%H: %M: %S", time.gmtime(time.time()-diffusion_start_time)))
 
                 if (epoch-1) % 5 == 0:
-                        
+                    print('refine social start')
                     refine_start_time=time.time()
                     h,t,new_score,decay= refine_social(diffusion,social_data.A,new_score,all_embed_frozen,social_embed_frozen,args,del_threshold,flip=True)
                     if decay:
