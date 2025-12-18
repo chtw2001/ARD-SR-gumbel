@@ -240,7 +240,7 @@ def train(args,log_path):
                         model.init_channel()
                         
         elif args.method == "original":
-            if epoch >10:
+            if epoch >0:
                 diffusion_epoch+=1
                 print("Training Diffusion")
                 ##Retrive user embedding from SR backbone for guidance

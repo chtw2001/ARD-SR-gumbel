@@ -267,6 +267,9 @@ class ARDSR(nn.Module):
         batch_indices = torch.arange(t.size(0), device=t.device)
         t_idx = self._map_cached_steps(torch.clamp(t, min=0))
         # Indexing: alphas[t, batch_indices, :]
+        if self.alphas_cumprod.device != t_idx.device:
+            t_idx = t_idx.to(self.alphas_cumprod.device)
+            batch_indices = batch_indices.to(self.alphas_cumprod.device)
         alpha_t = self.alphas_cumprod[t_idx, batch_indices, :]
         if alpha_t.device != t.device:
             alpha_t = alpha_t.to(t.device)
@@ -285,7 +288,12 @@ class ARDSR(nn.Module):
         # Efficient extraction
         batch_indices = torch.arange(t.size(0), device=t.device)
         t_idx = self._map_cached_steps(t)
-
+        cache_device = self.sqrt_alphas_cumprod.device
+        
+        if cache_device != t_idx.device:
+            t_idx = t_idx.to(cache_device)
+            batch_indices = batch_indices.to(cache_device)
+            
         sqrt_alphas = self.sqrt_alphas_cumprod[t_idx, batch_indices, :]
         sqrt_one_minus_alphas = self.sqrt_one_minus_alphas_cumprod[t_idx, batch_indices, :]
         
@@ -300,6 +308,9 @@ class ARDSR(nn.Module):
         
         # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
         mapped_t = self._map_cached_steps(t)
+        coef_device = self.posterior_variance.device
+        if coef_device != mapped_t.device:
+            mapped_t = mapped_t.to(coef_device)
         model_variance = self.posterior_variance[mapped_t]
 
         # 2. MLP 입력용 Timestep 텐서 생성 [수정된 부분]
