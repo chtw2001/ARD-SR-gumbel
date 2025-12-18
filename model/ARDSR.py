@@ -117,7 +117,9 @@ class ARDSR(nn.Module):
         """
 
         gamma2 = self.get_batch_betas(user_embed, idx, expand_steps=False)
-
+        # Avoid negative or >1 scales that can create invalid betas leading to
+        # NaNs in sqrt(1 - alpha) when alphas drift outside [0, 1].
+        gamma2 = torch.clamp(gamma2, min=0.0, max=1.0)
         # Track which steps must be materialized. For training we only need
         # the sampled timesteps (and their predecessors for SNR weighting).
         if selected_steps is not None:
@@ -133,12 +135,30 @@ class ARDSR(nn.Module):
         # Estimate cache size (we store ~4 tensors of this shape). If the
         # estimate exceeds ~1.5GB, fall back to CPU caching to avoid GPU OOM
         # during large-batch inference on datasets like Epinions.
-        cache_dtype = torch.float16 if gamma2.dtype == torch.float32 else gamma2.dtype
+        # During training (selected_steps provided) we only store a handful of
+        # timesteps, so keep full precision to avoid underflow/NaN issues. For
+        # full-schedule caching (sampling), use float16 to limit VRAM unless the
+        # caller explicitly opts out by providing selected_steps.
+        cache_dtype = torch.float32 if selected_steps is not None else torch.float16
         element_size = torch.tensor([], dtype=cache_dtype).element_size()
         est_bytes = len(needed) * gamma2.numel() * element_size * 4
         cache_device = self.device
-        if selected_steps is None and est_bytes > 1.5 * 1024 ** 3:
-            cache_device = torch.device("cpu")
+        if selected_steps is None:
+            # Heuristic: keep caches on GPU if we have enough free memory;
+            # otherwise, offload to CPU to avoid OOM. This reduces CPU<->GPU
+            # traffic for moderate schedules (e.g., 100 steps) while still
+            # protecting against memory spikes on very large batches.
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                free_mem, total_mem = torch.cuda.mem_get_info(device=self.device)
+                # Leave at least 25% headroom on the device.
+                gpu_budget = int(free_mem * 0.75)
+                # Cap the considered budget to a reasonable upper bound to avoid
+                # aggressive allocations on very large GPUs.
+                gpu_budget = min(gpu_budget, 12 * 1024 ** 3)
+                if est_bytes > gpu_budget:
+                    cache_device = torch.device("cpu")
+            elif est_bytes > 1.5 * 1024 ** 3:
+                cache_device = torch.device("cpu")
 
         # Keep variance_base on the computation device for beta_t calculation.
         variance_base = self.variance_base.to(gamma2.device)

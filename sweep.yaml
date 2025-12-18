@@ -21,7 +21,7 @@ parameters:
   temp:
     values: [3]
   steps:
-    values: [50] #, 200]
+    values: [100] #, 200]
   noise_scale:
     values: [1e-2] # , 1e-3]
   noise_min:
