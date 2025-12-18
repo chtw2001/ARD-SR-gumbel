@@ -309,7 +309,9 @@ class ARDSR(nn.Module):
         # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
         mapped_t = self._map_cached_steps(t)
         coef_device = self.posterior_variance.device
-        if coef_device != mapped_t.device:
+        if not torch.is_tensor(mapped_t):
+            mapped_t = torch.tensor(mapped_t, device=coef_device, dtype=torch.long)
+        elif coef_device != mapped_t.device:
             mapped_t = mapped_t.to(coef_device)
         model_variance = self.posterior_variance[mapped_t]
 
