@@ -3,7 +3,7 @@ project: ARD-SR-eval
 program: main.py
 parameters:
   dataset:
-    values: ["epinions"] # , "ciao"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
+    values: ["filmtrust"] # , "ciao"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
   
   lr:
     values: [1e-3] 
@@ -30,7 +30,7 @@ parameters:
     values: [1e-2] # , 1e-2]
 
   seed:
-    values: [42, 1004, 2025]
+    values: [42] # , 1004, 2025]
 
 
   gumbel_temp:
