@@ -8,7 +8,7 @@ parameters:
   lr:
     values: [1e-3] 
   gpu_id:
-    value: 0
+    value: 1
   wandb:
     value: True
   topN:
@@ -21,7 +21,7 @@ parameters:
   temp:
     values: [3]
   steps:
-    values: [10] #, 200]
+    values: [50] #, 200]
   noise_scale:
     values: [1e-2] # , 1e-3]
   noise_min:
