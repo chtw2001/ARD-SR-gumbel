@@ -130,7 +130,19 @@ class ARDSR(nn.Module):
             needed = list(range(self.steps))
 
         max_needed = max(needed)
+        # Estimate cache size (we store ~4 tensors of this shape). If the
+        # estimate exceeds ~1.5GB, fall back to CPU caching to avoid GPU OOM
+        # during large-batch inference on datasets like Epinions.
+        cache_dtype = torch.float16 if gamma2.dtype == torch.float32 else gamma2.dtype
+        element_size = torch.tensor([], dtype=cache_dtype).element_size()
+        est_bytes = len(needed) * gamma2.numel() * element_size * 4
+        cache_device = self.device
+        if selected_steps is None and est_bytes > 1.5 * 1024 ** 3:
+            cache_device = torch.device("cpu")
 
+        # Keep variance_base on the computation device for beta_t calculation.
+        variance_base = self.variance_base.to(gamma2.device)
+        
         # Start with alpha_cumprod = 1 for every user in the batch.
         alpha_cumprod = torch.ones(
             (gamma2.size(0), gamma2.size(1)), device=gamma2.device, dtype=gamma2.dtype
@@ -141,12 +153,9 @@ class ARDSR(nn.Module):
         cached_prev = []
         cached_beta = []
 
-        # Reduce dtype for cached tensors to save memory without affecting
-        # numerical stability for the current usage.
-        cache_dtype = torch.float16 if gamma2.dtype == torch.float32 else gamma2.dtype
 
         for step in range(max_needed + 1):
-            beta_t = gamma2 * self.variance_base[step]
+            beta_t = gamma2 * variance_base[step]
             alpha_t = 1.0 - beta_t
 
             if step in needed:
@@ -154,9 +163,9 @@ class ARDSR(nn.Module):
                 alpha_cumprod = alpha_cumprod * alpha_t
 
                 cached_steps.append(step)
-                cached_beta.append(beta_t.to(cache_dtype))
-                cached_prev.append(prev.to(cache_dtype))
-                cached_alpha.append(alpha_cumprod.to(cache_dtype))
+                cached_beta.append(beta_t.to(cache_device, dtype=cache_dtype))
+                cached_prev.append(prev.to(cache_device, dtype=cache_dtype))
+                cached_alpha.append(alpha_cumprod.to(cache_device, dtype=cache_dtype))
             else:
                 alpha_cumprod = alpha_cumprod * alpha_t
 
@@ -175,6 +184,7 @@ class ARDSR(nn.Module):
 
         # Store cached schedules
         self.cached_step_lookup = step_lookup
+        self.cache_device = cache_device
         
         self.sqrt_alphas_cumprod = sqrt_alphas_cumprod
         self.sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod
@@ -258,7 +268,9 @@ class ARDSR(nn.Module):
         t_idx = self._map_cached_steps(torch.clamp(t, min=0))
         # Indexing: alphas[t, batch_indices, :]
         alpha_t = self.alphas_cumprod[t_idx, batch_indices, :]
-        
+        if alpha_t.device != t.device:
+            alpha_t = alpha_t.to(t.device)
+            
         return alpha_t / (1 - alpha_t)
 
     def sample_timesteps(self, batch_size, device):
@@ -276,6 +288,10 @@ class ARDSR(nn.Module):
 
         sqrt_alphas = self.sqrt_alphas_cumprod[t_idx, batch_indices, :]
         sqrt_one_minus_alphas = self.sqrt_one_minus_alphas_cumprod[t_idx, batch_indices, :]
+        
+        if sqrt_alphas.device != x_start.device:
+            sqrt_alphas = sqrt_alphas.to(x_start.device)
+            sqrt_one_minus_alphas = sqrt_one_minus_alphas.to(x_start.device)
 
         return sqrt_alphas * x_start + sqrt_one_minus_alphas * noise
 
@@ -295,16 +311,26 @@ class ARDSR(nn.Module):
         model_output = self.MLP(x, batch_embed, t_batch)
 
         pred_xstart = model_output
-        
+        if model_variance.device != x.device:
+            # Move all cached slices required for this step to the current device
+            model_variance = model_variance.to(x.device)
+
         # 정수 t를 사용하여 계수(Coefficient) 추출
         if not self.ddim:
             coef1 = self.posterior_mean_coef1[mapped_t]
             coef2 = self.posterior_mean_coef2[mapped_t]
+            if coef1.device != x.device:
+                coef1 = coef1.to(x.device)
+                coef2 = coef2.to(x.device)
             model_mean = coef1 * pred_xstart + coef2 * x
         else:
             sqrt_alpha_prev = torch.sqrt(self.alphas_cumprod_prev[mapped_t])
             coef2 = self.fast_posterior_coef2[mapped_t]
             coef3 = self.fast_posterior_coef3[mapped_t]
+            if sqrt_alpha_prev.device != x.device:
+                sqrt_alpha_prev = sqrt_alpha_prev.to(x.device)
+                coef2 = coef2.to(x.device)
+                coef3 = coef3.to(x.device)
             model_mean = sqrt_alpha_prev * pred_xstart + coef2 * x - coef3 * pred_xstart
 
         return {"mean": model_mean, "variance": model_variance, "log_variance": torch.log(model_variance.clamp(min=1e-20))}
