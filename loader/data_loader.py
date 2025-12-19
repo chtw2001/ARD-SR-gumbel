@@ -4,7 +4,7 @@ import scipy.sparse as sp
 import time
 import math
 from torch.utils.data import Dataset
-
+import torch
 from .loader_base import DataLoaderBase
 from scipy.sparse import coo_matrix, csr_matrix
 import os
@@ -164,14 +164,20 @@ class DataDiffusionCL(Dataset):
         
         # 재현성을 위한 seed 설정
         np.random.seed(self.seed)
-        
-        non_zero_indices = [i for i, row in enumerate(self.data) if (row != 0).sum() > 0]  
-        max_samples = len(non_zero_indices)  
+
+        if sp.issparse(self.data):
+            row_nnz = np.diff(self.data.indptr)
+            non_zero_indices = np.flatnonzero(row_nnz > 0)
+            row_degrees = row_nnz[non_zero_indices]
+        else:
+            non_zero_indices = [i for i, row in enumerate(self.data) if (row != 0).sum() > 0]
+            row_degrees = np.array([(row == 1).sum() for row in self.data])
+            row_degrees = row_degrees[non_zero_indices]
+
+        max_samples = len(non_zero_indices)
         proportion = min(1, self.initial_prop + (1 - self.initial_prop) * self.current_epoch / self.max_epochs)
         num_samples = int(proportion * max_samples)
 
-        row_degrees = np.array([(row == 1).sum() for row in self.data])
-        row_degrees = row_degrees[non_zero_indices] 
         degree_ranks = np.argsort(np.argsort(-row_degrees))  
         if ce is not None:
             ce = ce[non_zero_indices]  
@@ -191,4 +197,6 @@ class DataDiffusionCL(Dataset):
     def __getitem__(self, index):
         original_index = self.non_zero_indices[index]
         item = self.data[original_index]
+        if sp.issparse(self.data):
+            item = torch.from_numpy(item.toarray().squeeze().astype(np.float32))
         return original_index, item

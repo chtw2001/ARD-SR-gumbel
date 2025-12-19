@@ -92,7 +92,7 @@ def train(args,log_path):
         LINE_optimizer = optim.Adam(LINE_MODULE.parameters(), lr=args.lr)
         new_social, ce_prev = None, None
         A_target   = torch.FloatTensor(social_data.A).to(device)  # EMA target
-        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
+        train_social_dataset = DataDiffusionCL(social_data,0)
         cur_loader = torch_data.DataLoader(
             train_social_dataset, 
             batch_size=args.line_batch,
@@ -105,7 +105,7 @@ def train(args,log_path):
             drop_last=False
         )
     elif args.method == "original":
-        train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),0)
+        train_social_dataset = DataDiffusionCL(social_data,0)
         diffusion_train_loader = torch_data.DataLoader(
             train_social_dataset, 
             batch_size=args.batch_size,
@@ -300,7 +300,7 @@ def train(args,log_path):
 
                     social_data = sp.csr_matrix((np.ones_like(h),(h,t)), dtype='float32', shape=(data.n_users, data.n_users))
                     ce_for_1s = ce_buffer if ce_buffer is not None else mean_cross_entropy_for_ones(social_data,new_score)
-                    train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),epoch,ce_for_1s)
+                    train_social_dataset = DataDiffusionCL(social_data,epoch,ce_for_1s)
                     diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn) 
                     data.train_social_h_list=h
                     data.train_social_t_list=t
