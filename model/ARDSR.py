@@ -565,7 +565,14 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
                     prediction = torch.sigmoid(prediction)
                     avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
-                except RuntimeError as exc:
+                except (RuntimeError, MemoryError) as exc:
+                    if isinstance(exc, MemoryError):
+                        print(
+                            f"[refine_social] Host OOM at rows {start}:{end}, reducing batch_size from {batch_size}"
+                        )
+                        batch_size = max(64, batch_size // 2)
+                        gc.collect()
+                        continue
                     if use_cuda and "out of memory" in str(exc).lower() and batch_size > 1:
                         print(
                             f"[refine_social] CUDA OOM at rows {start}:{end}, reducing batch_size from {batch_size}"
