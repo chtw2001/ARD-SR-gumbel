@@ -440,7 +440,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     all_embed_norm = F.normalize(all_embed, p=2, dim=1)
     all_embed_norm_t = all_embed_norm.t().contiguous()
     
-    num_rows = len(social_data)
+    num_rows = social_data.shape[0]
     num_cols = social_data.shape[1]
     # [Optimization] Increase batch size based on available GPU memory for faster throughput.
     if args.device != "cpu":
