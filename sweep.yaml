@@ -3,12 +3,12 @@ project: ARD-SR-eval
 program: main.py
 parameters:
   dataset:
-    values: ["epinions"] # , "ciao"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
+    values: ["ciao", "yelp", "douban", "epinions"] #  , "ciao", "yelp", "douban", "epinions"] # "ciao", "yelp", "filmtrust", "lastfm", "douban", "flickr"
   
   lr:
     values: [1e-3] 
   gpu_id:
-    value: 0
+    value: 1
   wandb:
     value: True
   topN:
@@ -30,7 +30,7 @@ parameters:
     values: [1e-2] # , 1e-2]
 
   seed:
-    values: [42] # , 1004, 2025] # , 1004, 2025]
+    values: [42, 1004, 2025] # , 1004, 2025]
 
 
   gumbel_temp:

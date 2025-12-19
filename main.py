@@ -30,6 +30,7 @@ def train(args,log_path):
         wandb.init(
             project="ARD-SR-eval",
             name=f"ARD-SR-{args.dataset}_batch-wise",
+            tags=["new"],
         )
     
     log_save_id = create_log_id(args.save_dir)
@@ -240,7 +241,7 @@ def train(args,log_path):
                         model.init_channel()
                         
         elif args.method == "original":
-            if epoch >0:
+            if epoch >10:
                 diffusion_epoch+=1
                 print("Training Diffusion")
                 ##Retrive user embedding from SR backbone for guidance
@@ -274,6 +275,8 @@ def train(args,log_path):
                     print('refine social start')
                     refine_start_time=time.time()
                     h,t,new_score,decay,ce_buffer = refine_social(diffusion,social_data,new_score,all_embed_frozen,social_embed_frozen,args,del_threshold,flip=True)
+                    if len(h) == 0 or len(t) == 0:
+                        h, t = social_data.nonzero()
                     if decay:
                         del_threshold = max(del_threshold*0.99,0.45)
 
