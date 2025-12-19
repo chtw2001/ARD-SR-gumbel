@@ -433,8 +433,20 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     
     num_rows = len(social_data)
     num_cols = social_data.shape[1]
-    # [Optimization] Increase batch size significantly (e.g., 2048 or 4096)
-    batch_size = 1024 if num_cols > 5000 else 2048
+    # [Optimization] Increase batch size based on available GPU memory for faster throughput.
+    if args.device != "cpu":
+        try:
+            free_mem, _ = torch.cuda.mem_get_info(device=args.device)
+        except TypeError:
+            free_mem, _ = torch.cuda.mem_get_info()
+        # Rough estimate: cos_sim + prediction + batch_social + batch_score
+        bytes_per_row = num_cols * 2 * 4
+        target_mem = int(free_mem * 0.6)
+        est_batch = max(256, min(num_rows, target_mem // max(bytes_per_row, 1)))
+        batch_size = est_batch
+        torch.backends.cuda.matmul.allow_tf32 = True
+    else:
+        batch_size = 1024 if num_cols > 5000 else 2048
     num_batches = (num_rows + batch_size - 1) // batch_size
 
     # Stream predictions to a disk-backed memmap to avoid keeping a full
@@ -444,9 +456,12 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         tmp_dir,
         f"new_score_{os.getpid()}_{int(time.time())}.mmap",
     )
-    new_score_mm = np.lib.format.open_memmap(
-        mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
-    )
+    try:
+        new_score_mm = np.empty((num_rows, num_cols), dtype=np.float16)
+    except MemoryError:
+        new_score_mm = np.lib.format.open_memmap(
+            mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
+        )
 
     # Preallocate CE buffer so we don't re-read the memmap after writing.
     ce_buffer = np.zeros(num_rows, dtype=np.float32)
@@ -563,7 +578,8 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
 
     # Ensure data is flushed to disk before any CPU reads
-    new_score_mm.flush()
+    if isinstance(new_score_mm, np.memmap):
+        new_score_mm.flush()
     new_score_cpu = new_score_mm
     
     return h_list, t_list, new_score_cpu, decay, ce_buffer
