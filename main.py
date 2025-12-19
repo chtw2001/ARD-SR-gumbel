@@ -4,7 +4,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # cuBLAS 결정적 모드
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 
-import argparse, os, time, gc, wandb, tempfile
+import argparse, os, time, gc, wandb
 import numpy as np, scipy.sparse as sp
 import torch, torch.nn.functional as F
 import torch.utils.data as torch_data
@@ -22,27 +22,6 @@ from utils.evaluate_utils import evaluate, print_results
 from utils.log_helper     import logging_config, create_log_id
 from loader.data_loader   import SRDataLoader, DataDiffusionCL
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
-def init_score_memmap(social_csr, args):
-    tmp_dir = getattr(args, "tmp_dir", None) or tempfile.gettempdir()
-    mmap_path = os.path.join(
-        tmp_dir,
-        f"init_score_{os.getpid()}_{int(time.time())}.mmap",
-    )
-    score_mm = np.lib.format.open_memmap(
-        mmap_path, mode="w+", dtype=np.float16, shape=social_csr.shape
-    )
-    score_mm[:] = 0.0
-    indptr = social_csr.indptr
-    indices = social_csr.indices
-    for row in range(social_csr.shape[0]):
-        row_start = indptr[row]
-        row_end = indptr[row + 1]
-        if row_end > row_start:
-            score_mm[row, indices[row_start:row_end]] = 1.0
-    score_mm.flush()
-    return score_mm
-
 
 
 def train(args,log_path):
@@ -117,7 +96,7 @@ def train(args,log_path):
             persistent_workers=True,
             drop_last=False
         )
-        new_score = init_score_memmap(social_data, args)
+        new_score = None
         diffusion = ARDSR(data,args).to(device)
         diffusion_optimizer = optim.Adam(diffusion.parameters(),lr=args.lr)
         del_threshold = 0.6
@@ -299,7 +278,7 @@ def train(args,log_path):
                         del_threshold = max(del_threshold*0.99,0.45)
 
                     social_data = sp.csr_matrix((np.ones_like(h),(h,t)), dtype='float32', shape=(data.n_users, data.n_users))
-                    ce_for_1s = ce_buffer if ce_buffer is not None else mean_cross_entropy_for_ones(social_data,new_score)
+                    ce_for_1s = ce_buffer
                     train_social_dataset = DataDiffusionCL(social_data,epoch,ce_for_1s)
                     diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn) 
                     data.train_social_h_list=h

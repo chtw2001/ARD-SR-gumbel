@@ -462,27 +462,29 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     else:
         batch_size = 1024 if num_cols > 5000 else 2048
 
-    # Stream predictions to a disk-backed memmap to avoid keeping a full
-    # dense score matrix in RAM. Using float16 halves the footprint.
-    tmp_dir = getattr(args, "tmp_dir", None) or tempfile.gettempdir()
-    mmap_path = os.path.join(
-        tmp_dir,
-        f"new_score_{os.getpid()}_{int(time.time())}.mmap",
-    )
-    score_bytes = num_rows * num_cols * np.dtype(np.float16).itemsize
-    max_in_memory_bytes = 0
-    use_memmap = score_bytes > max_in_memory_bytes
-    if use_memmap:
-        new_score_mm = np.lib.format.open_memmap(
-            mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
+    # Stream predictions to a disk-backed memmap only when a score cache is needed.
+    new_score_mm = None
+    if score is not None:
+        tmp_dir = getattr(args, "tmp_dir", None) or tempfile.gettempdir()
+        mmap_path = os.path.join(
+            tmp_dir,
+            f"new_score_{os.getpid()}_{int(time.time())}.mmap",
         )
-    else:
-        try:
-            new_score_mm = np.empty((num_rows, num_cols), dtype=np.float16)
-        except MemoryError:
+        score_bytes = num_rows * num_cols * np.dtype(np.float16).itemsize
+        max_in_memory_bytes = 0
+        use_memmap = score_bytes > max_in_memory_bytes
+        if use_memmap:
             new_score_mm = np.lib.format.open_memmap(
                 mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
             )
+        else:
+            try:
+                new_score_mm = np.empty((num_rows, num_cols), dtype=np.float16)
+            except MemoryError:
+                new_score_mm = np.lib.format.open_memmap(
+                    mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
+                )
+
 
     # Preallocate CE buffer so we don't re-read the memmap after writing.
     ce_buffer = np.zeros(num_rows, dtype=np.float32)
@@ -622,7 +624,10 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                     ce_buffer[start + nz_idx.cpu().numpy()] = ce_rows[nz_idx].cpu().numpy()
 
             # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
-            new_score_mm[start:end] = avg_prediction.detach().to("cpu", dtype=torch.float16).numpy()
+            if new_score_mm is not None:
+                new_score_mm[start:end] = avg_prediction.detach().to(
+                    "cpu", dtype=torch.float16
+                ).numpy()
 
             del avg_prediction, prediction, batch_social, batch_score
             start = end
