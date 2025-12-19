@@ -62,7 +62,6 @@ class ARDSR(nn.Module):
             variance_base[0] = 1e-5
         return variance_base
 
-    # def get_batch_betas(self, user_embed, idx):
     def get_batch_betas(self, user_embed, idx, expand_steps=True):
         # [Optimization] Matrix Multiplication for Cosine Similarity
         # A: (Batch, Dim), B: (N_users, Dim) -> Result: (Batch, N_users)
@@ -80,15 +79,16 @@ class ARDSR(nn.Module):
         
         if not expand_steps:
             return gamma2
+
         # Expand variance_base: (Steps) -> (Steps, 1, 1)
         var_base_view = self.variance_base.view(-1, 1, 1)
-        
+
         # Expand gamma2: (Batch, N_users) -> (1, Batch, N_users)
         gamma2_view = gamma2.unsqueeze(0)
-        
+
         # Broadcasting handles the rest: (Steps, Batch, N_users)
         score = gamma2_view * var_base_view
-        
+
         return score
 
     def _map_cached_steps(self, t):
@@ -123,6 +123,7 @@ class ARDSR(nn.Module):
         # Avoid negative or >1 scales that can create invalid betas leading to
         # NaNs in sqrt(1 - alpha) when alphas drift outside [0, 1].
         gamma2 = torch.clamp(gamma2, min=0.0, max=1.0)
+
         # Track which steps must be materialized. For training we only need
         # the sampled timesteps (and their predecessors for SNR weighting).
         if selected_steps is not None:
@@ -135,6 +136,7 @@ class ARDSR(nn.Module):
             needed = list(range(self.steps))
 
         max_needed = max(needed)
+
         # Estimate cache size (we store ~4 tensors of this shape). If the
         # estimate exceeds ~1.5GB, fall back to CPU caching to avoid GPU OOM
         # during large-batch inference on datasets like Epinions.
@@ -165,7 +167,7 @@ class ARDSR(nn.Module):
 
         # Keep variance_base on the computation device for beta_t calculation.
         variance_base = self.variance_base.to(gamma2.device)
-        
+
         # Start with alpha_cumprod = 1 for every user in the batch.
         alpha_cumprod = torch.ones(
             (gamma2.size(0), gamma2.size(1)), device=gamma2.device, dtype=gamma2.dtype
@@ -175,7 +177,6 @@ class ARDSR(nn.Module):
         cached_alpha = []
         cached_prev = []
         cached_beta = []
-
 
         for step in range(max_needed + 1):
             beta_t = gamma2 * variance_base[step]
@@ -198,7 +199,7 @@ class ARDSR(nn.Module):
 
         sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
         sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-        
+
         # Build a lookup tensor so we can map the original timestep to the
         # cached slice without keeping the full schedule in memory.
         step_lookup = torch.full((self.steps,), -1, device=self.device, dtype=torch.long)
@@ -208,7 +209,6 @@ class ARDSR(nn.Module):
         # Store cached schedules
         self.cached_step_lookup = step_lookup
         self.cache_device = cache_device
-        
         self.sqrt_alphas_cumprod = sqrt_alphas_cumprod
         self.sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod
         self.alphas_cumprod = alphas_cumprod
@@ -231,12 +231,10 @@ class ARDSR(nn.Module):
         # Cleanup intermediate tensors we no longer need
         del gamma2, alpha_cumprod, cached_alpha, cached_prev, cached_beta
 
-
     def training_losses(self, idx, x_start, all_embed, all_social_embed):
-        
         batch_size = x_start.size(0)
         ts, pt = self.sample_timesteps(batch_size, x_start.device)
-        
+
         # 1. 배치 데이터 및 확산 스케줄 계산 (필요한 스텝만 캐싱)
         self.calculate_batch_for_diffusion(all_embed, idx, selected_steps=ts)
 
@@ -281,13 +279,18 @@ class ARDSR(nn.Module):
         # Improved extraction logic
         # t is (Batch,), alphas_cumprod is (Steps, Batch, N_users)
         # We need to gather the alpha for each batch item at its specific timestep
-        
+
         # Gather logic: select [t[b], b, :] for all b
         # Optimized extract using gather/indexing
         # alphas: (Steps, Batch, N_users) -> Select step t for each batch
-        
+
         # Create indices for gathering
         batch_indices = torch.arange(t.size(0), device=t.device)
+
+        # Clamp to the earliest cached step to avoid negative lookups when
+        # callers request t-1 for t == 0. The cached schedule always includes
+        # step 0, so this preserves valid indexing while preventing
+        # IndexError from _map_cached_steps.
         t_idx = self._map_cached_steps(torch.clamp(t, min=0))
         # Indexing: alphas[t, batch_indices, :]
         if self.alphas_cumprod.device != t_idx.device:
@@ -296,7 +299,7 @@ class ARDSR(nn.Module):
         alpha_t = self.alphas_cumprod[t_idx, batch_indices, :]
         if alpha_t.device != t.device:
             alpha_t = alpha_t.to(t.device)
-            
+
         return alpha_t / (1 - alpha_t)
 
     def sample_timesteps(self, batch_size, device):
@@ -307,19 +310,19 @@ class ARDSR(nn.Module):
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
-            
+
         # Efficient extraction
         batch_indices = torch.arange(t.size(0), device=t.device)
+
         t_idx = self._map_cached_steps(t)
         cache_device = self.sqrt_alphas_cumprod.device
-        
         if cache_device != t_idx.device:
             t_idx = t_idx.to(cache_device)
             batch_indices = batch_indices.to(cache_device)
-            
+
         sqrt_alphas = self.sqrt_alphas_cumprod[t_idx, batch_indices, :]
         sqrt_one_minus_alphas = self.sqrt_one_minus_alphas_cumprod[t_idx, batch_indices, :]
-        
+
         if sqrt_alphas.device != x_start.device:
             sqrt_alphas = sqrt_alphas.to(x_start.device)
             sqrt_one_minus_alphas = sqrt_one_minus_alphas.to(x_start.device)
@@ -328,9 +331,10 @@ class ARDSR(nn.Module):
 
     def p_mean_variance(self, x, t, batch_embed):
         # t는 여기서 정수(int) 값으로 들어옵니다 (Loop에서 i를 넘겨줌)
-        
-        # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
+
         mapped_t = self._map_cached_steps(t)
+
+        # 1. Variance 추출 (정수 인덱싱은 텐서에서도 작동하므로 그대로 둡니다)
         coef_device = self.posterior_variance.device
         if not torch.is_tensor(mapped_t):
             mapped_t = torch.tensor(mapped_t, device=coef_device, dtype=torch.long)
@@ -352,6 +356,10 @@ class ARDSR(nn.Module):
             model_variance = model_variance.to(x.device)
 
         # 정수 t를 사용하여 계수(Coefficient) 추출
+        if model_variance.device != x.device:
+            # Move all cached slices required for this step to the current device
+            model_variance = model_variance.to(x.device)
+
         if not self.ddim:
             coef1 = self.posterior_mean_coef1[mapped_t]
             coef2 = self.posterior_mean_coef2[mapped_t]
@@ -380,7 +388,7 @@ class ARDSR(nn.Module):
         else:
             # t_tensor = torch.full((x_start.size(0),), noise_step - 1, device=x_start.device, dtype=torch.long)
             # Use q_sample directly
-            # For inference, q_sample expects t as a batch of indices. 
+            # For inference, q_sample expects t as a batch of indices.
             # But here let's simplify: usually we start from pure noise for generation, or noisy input for refinement.
             # Re-using q_sample logic requires proper t tensor
             t_tensor = torch.tensor([noise_step - 1] * x_start.shape[0], device=x_start.device).long()
@@ -439,15 +447,19 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             free_mem, _ = torch.cuda.mem_get_info(device=args.device)
         except TypeError:
             free_mem, _ = torch.cuda.mem_get_info()
-        # Rough estimate: cos_sim + prediction + batch_social + batch_score
-        bytes_per_row = num_cols * 2 * 4
-        target_mem = int(free_mem * 0.6)
-        est_batch = max(256, min(num_rows, target_mem // max(bytes_per_row, 1)))
-        batch_size = est_batch
+        # Rough estimate: cos_sim + prediction + batch_social + batch_score (float16)
+        bytes_per_row = num_cols * 2 * 2
+        target_mem = int(free_mem * 0.3)
+        est_batch = max(128, min(num_rows, target_mem // max(bytes_per_row, 1)))
+        batch_size = min(est_batch, 4096)
+        # Cap batch size to limit host RAM usage when materializing CPU slices.
+        host_bytes_per_row = num_cols * 2
+        host_target = 256 * 1024**2
+        host_batch = max(64, host_target // max(host_bytes_per_row, 1))
+        batch_size = min(batch_size, host_batch)
         torch.backends.cuda.matmul.allow_tf32 = True
     else:
         batch_size = 1024 if num_cols > 5000 else 2048
-    num_batches = (num_rows + batch_size - 1) // batch_size
 
     # Stream predictions to a disk-backed memmap to avoid keeping a full
     # dense score matrix in RAM. Using float16 halves the footprint.
@@ -480,48 +492,65 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     t_list = []
     decay = False
     
+    h_list = []
+    t_list = []
+    decay = False
+
     use_cuda = args.device != "cpu"
 
     with torch.inference_mode():
-        for i in range(num_batches):
-            start = i * batch_size
+        start = 0
+        while start < num_rows:
             end = min(start + batch_size, num_rows)
-            idx_tensor = torch.arange(start, end, device=args.device)
-            
-            with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
-                batch_social_np = np.ascontiguousarray(social_data[start:end])
-                batch_score_np = np.ascontiguousarray(score[start:end])
-                batch_social_cpu = torch.from_numpy(batch_social_np)
-                batch_score_cpu = torch.from_numpy(batch_score_np)
-                if use_cuda:
-                    batch_social_cpu = batch_social_cpu.pin_memory()
-                    batch_score_cpu = batch_score_cpu.pin_memory()
-                batch_social = batch_social_cpu.to(
-                    args.device, dtype=torch.float16, non_blocking=use_cuda
-                )
-                batch_score = batch_score_cpu.to(
-                    args.device, dtype=torch.float16, non_blocking=use_cuda)
 
-                if flip:
-                    batch_embed = all_embed_norm[idx_tensor]
-                    cos_sim = torch.matmul(batch_embed, all_embed_norm_t)
+            try:
+                idx_tensor = torch.arange(start, end, device=args.device)
 
-                    flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
-                    prediction = diffusion.p_sample(
-                        flipped_batch,
-                        idx_tensor,
-                        all_embed,
-                        all_social,
-                        args.steps,
-                        args.steps,
+                with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
+                    batch_social_np = np.asarray(social_data[start:end])
+                    batch_score_np = np.asarray(score[start:end])
+                    if not batch_social_np.flags["C_CONTIGUOUS"]:
+                        batch_social_np = np.ascontiguousarray(batch_social_np)
+                    if not batch_score_np.flags["C_CONTIGUOUS"]:
+                        batch_score_np = np.ascontiguousarray(batch_score_np)
+                    batch_social_cpu = torch.from_numpy(batch_social_np)
+                    batch_score_cpu = torch.from_numpy(batch_score_np)
+                    if use_cuda:
+                        batch_social_cpu = batch_social_cpu.pin_memory()
+                        batch_score_cpu = batch_score_cpu.pin_memory()
+                    batch_social = batch_social_cpu.to(
+                        args.device, dtype=torch.float16, non_blocking=use_cuda
                     )
-                else:
-                    prediction = diffusion.p_sample(
-                        batch_social, idx_tensor, all_embed, all_social, args.steps, args.steps
+                    batch_score = batch_score_cpu.to(
+                        args.device, dtype=torch.float16, non_blocking=use_cuda
                     )
 
-                prediction = torch.sigmoid(prediction)
-                avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
+                    if flip:
+                        batch_embed = all_embed_norm[idx_tensor]
+                        cos_sim = torch.matmul(batch_embed, all_embed_norm_t)
+
+                        flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
+                        prediction = diffusion.p_sample(
+                            flipped_batch,
+                            idx_tensor,
+                            all_embed,
+                            all_social,
+                            args.steps,
+                            args.steps,
+                        )
+                    else:
+                        prediction = diffusion.p_sample(
+                            batch_social, idx_tensor, all_embed, all_social, args.steps, args.steps
+                        )
+
+                    prediction = torch.sigmoid(prediction)
+                    avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
+            except RuntimeError as exc:
+                if use_cuda and "out of memory" in str(exc).lower() and batch_size > 1:
+                    torch.cuda.empty_cache()
+                    batch_size = max(64, batch_size // 2)
+                    continue
+                raise
 
             # Deletion candidates (working on GPU for speed)
             existing_mask = batch_social != 0
@@ -581,17 +610,15 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
             # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
             new_score_mm[start:end] = avg_prediction.detach().to("cpu", dtype=torch.float16).numpy()
+
             del avg_prediction, prediction, batch_social, batch_score
+            start = end
 
-
-
-    # Ensure data is flushed to disk before any CPU reads
     if isinstance(new_score_mm, np.memmap):
         new_score_mm.flush()
     new_score_cpu = new_score_mm
-    
-    return h_list, t_list, new_score_cpu, decay, ce_buffer
 
+    return h_list, t_list, new_score_cpu, decay, ce_buffer
 
 def flip_tensor(batch, cos_similarities, seed):
     # Optimized flip without repeated manual seeding inside batch ops if not strictly necessary
