@@ -457,7 +457,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         f"new_score_{os.getpid()}_{int(time.time())}.mmap",
     )
     score_bytes = num_rows * num_cols * np.dtype(np.float16).itemsize
-    max_in_memory_bytes = 2 * 1024**3
+    max_in_memory_bytes = 512 * 1024**2
     use_memmap = score_bytes > max_in_memory_bytes
     if use_memmap:
         new_score_mm = np.lib.format.open_memmap(
