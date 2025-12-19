@@ -449,7 +449,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             free_mem, _ = torch.cuda.mem_get_info()
         # Rough estimate: cos_sim + prediction + batch_social + batch_score (float16)
         bytes_per_row = num_cols * 2 * 2
-        target_mem = int(free_mem * 0.3)
+        target_mem = int(free_mem * 0.5)
         est_batch = max(128, min(num_rows, target_mem // max(bytes_per_row, 1)))
         batch_size = min(est_batch, 4096)
         # Cap batch size to limit host RAM usage when materializing CPU slices.
@@ -469,7 +469,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         f"new_score_{os.getpid()}_{int(time.time())}.mmap",
     )
     score_bytes = num_rows * num_cols * np.dtype(np.float16).itemsize
-    max_in_memory_bytes = 512 * 1024**2
+    max_in_memory_bytes = 0
     use_memmap = score_bytes > max_in_memory_bytes
     if use_memmap:
         new_score_mm = np.lib.format.open_memmap(
@@ -488,12 +488,9 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     
     # Pre-move static large tensors to GPU if VRAM allows, otherwise keep on CPU and slice
     # Assuming social_data and score fit in memory but we slice them
-    h_list = []
-    t_list = []
-    decay = False
-    
-    h_list = []
-    t_list = []
+
+    h_chunks = []
+    t_chunks = []
     decay = False
 
     use_cuda = args.device != "cpu"
@@ -564,8 +561,10 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                     del_rows = rows[under_mask]
                     del_cols = cols[under_mask]
 
-                    h_list.extend((del_rows + start).tolist())
-                    t_list.extend(del_cols.tolist())
+                    h_chunks.append(
+                        (del_rows + start).to("cpu", dtype=torch.int32).numpy()
+                    )
+                    t_chunks.append(del_cols.to("cpu", dtype=torch.int32).numpy())
 
                     # Row-wise add-backs using masked top-k
                     del_counts = torch.bincount(del_rows, minlength=avg_prediction.size(0))
@@ -589,8 +588,14 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                             valid = torch.isfinite(vals)
                             if valid.any():
                                 cols_final = cols_sel[valid]
-                                h_list.extend([row_offset.item() + start] * cols_final.numel())
-                                t_list.extend(cols_final.tolist())
+                                h_chunks.append(
+                                    (cols_final.new_full((cols_final.numel(),), row_offset + start))
+                                    .to("cpu", dtype=torch.int32)
+                                    .numpy()
+                                )
+                                t_chunks.append(
+                                    cols_final.to("cpu", dtype=torch.int32).numpy()
+                                )
 
                 # Per-row CE for existing edges (cpu buffer to avoid second pass)
                 ce_rows = torch.zeros(end - start, device=args.device)
@@ -618,7 +623,14 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         new_score_mm.flush()
     new_score_cpu = new_score_mm
 
-    return h_list, t_list, new_score_cpu, decay, ce_buffer
+    if h_chunks:
+        h_out = np.concatenate(h_chunks)
+        t_out = np.concatenate(t_chunks)
+    else:
+        h_out = np.empty((0,), dtype=np.int32)
+        t_out = np.empty((0,), dtype=np.int32)
+
+    return h_out, t_out, new_score_cpu, decay, ce_buffer
 
 def flip_tensor(batch, cos_similarities, seed):
     # Optimized flip without repeated manual seeding inside batch ops if not strictly necessary
