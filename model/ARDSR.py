@@ -454,7 +454,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         est_batch = max(128, min(num_rows, target_mem // max(bytes_per_row, 1)))
         batch_size = min(est_batch, 4096)
         # Cap batch size to limit host RAM usage when materializing CPU slices.
-        host_bytes_per_row = num_cols * 2
+        host_bytes_per_row = num_cols * 2 * 2
         host_target = 256 * 1024**2
         host_batch = max(64, host_target // max(host_bytes_per_row, 1))
         batch_size = min(batch_size, host_batch)
@@ -513,13 +513,16 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                         batch_social_np = np.asarray(social_data[start:end])
                         if not batch_social_np.flags["C_CONTIGUOUS"]:
                             batch_social_np = np.ascontiguousarray(batch_social_np)
-
+                    if batch_social_np.dtype != np.float16:
+                        batch_social_np = batch_social_np.astype(np.float16, copy=False)
                     if score is None:
                         batch_score_np = batch_social_np
                     else:
                         batch_score_np = np.asarray(score[start:end])
                         if not batch_score_np.flags["C_CONTIGUOUS"]:
                             batch_score_np = np.ascontiguousarray(batch_score_np)
+                        if batch_score_np.dtype != np.float16:
+                            batch_score_np = batch_score_np.astype(np.float16, copy=False)
                     batch_social_cpu = torch.from_numpy(batch_social_np)
                     batch_score_cpu = torch.from_numpy(batch_score_np)
                     if use_cuda:
