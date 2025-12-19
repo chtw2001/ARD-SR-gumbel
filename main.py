@@ -280,7 +280,18 @@ def train(args,log_path):
                     social_data = sp.csr_matrix((np.ones_like(h),(h,t)), dtype='float32', shape=(data.n_users, data.n_users))
                     ce_for_1s = ce_buffer
                     train_social_dataset = DataDiffusionCL(social_data,epoch,ce_for_1s)
-                    diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn) 
+                    if diffusion_train_loader is not None:
+                        try:
+                            if diffusion_train_loader._iterator is not None:
+                                diffusion_train_loader._iterator._shutdown_workers()
+                        except Exception:
+                            pass
+                    diffusion_train_loader = DataLoader(
+                        train_social_dataset,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        worker_init_fn=worker_init_fn,
+                    )
                     data.train_social_h_list=h
                     data.train_social_t_list=t
                     model.init_channel()
