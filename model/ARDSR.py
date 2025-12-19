@@ -510,7 +510,9 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
                     with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
                         if sp.issparse(social_data):
-                            batch_social_np = social_data[start:end].astype(np.float16).toarray()
+                            batch_social_np = social_data[start:end].toarray().astype(
+                                np.float16, copy=False
+                            )
                         else:
                             batch_social_np = np.asarray(social_data[start:end])
                             if not batch_social_np.flags["C_CONTIGUOUS"]:
