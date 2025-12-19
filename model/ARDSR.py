@@ -462,9 +462,11 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             host_bytes_per_row = num_cols * 2
         if score is not None:
             host_bytes_per_row *= 2
-        host_target = 256 * 1024**2
+        host_target = 128 * 1024**2
         host_batch = max(64, host_target // max(host_bytes_per_row, 1))
         batch_size = min(batch_size, host_batch)
+        if sp.issparse(social_data):
+            batch_size = min(batch_size, 256)
         torch.backends.cuda.matmul.allow_tf32 = True
     else:
         batch_size = 1024 if num_cols > 5000 else 2048
