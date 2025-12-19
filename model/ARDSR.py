@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 import gc
+import scipy.sparse as sp
 from .DNN import DNN
 
 class ARDSR(nn.Module):
@@ -504,12 +505,19 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                 idx_tensor = torch.arange(start, end, device=args.device)
 
                 with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
-                    batch_social_np = np.asarray(social_data[start:end])
-                    batch_score_np = np.asarray(score[start:end])
-                    if not batch_social_np.flags["C_CONTIGUOUS"]:
-                        batch_social_np = np.ascontiguousarray(batch_social_np)
-                    if not batch_score_np.flags["C_CONTIGUOUS"]:
-                        batch_score_np = np.ascontiguousarray(batch_score_np)
+                    if sp.issparse(social_data):
+                        batch_social_np = social_data[start:end].toarray()
+                    else:
+                        batch_social_np = np.asarray(social_data[start:end])
+                        if not batch_social_np.flags["C_CONTIGUOUS"]:
+                            batch_social_np = np.ascontiguousarray(batch_social_np)
+
+                    if score is None:
+                        batch_score_np = batch_social_np
+                    else:
+                        batch_score_np = np.asarray(score[start:end])
+                        if not batch_score_np.flags["C_CONTIGUOUS"]:
+                            batch_score_np = np.ascontiguousarray(batch_score_np)
                     batch_social_cpu = torch.from_numpy(batch_social_np)
                     batch_score_cpu = torch.from_numpy(batch_score_np)
                     if use_cuda:
