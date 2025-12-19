@@ -455,7 +455,13 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         est_batch = max(128, min(num_rows, target_mem // max(bytes_per_row, 1)))
         batch_size = min(est_batch, 4096)
         # Cap batch size to limit host RAM usage when materializing CPU slices.
-        host_bytes_per_row = num_cols * 2 * 2
+        if sp.issparse(social_data):
+            # scipy toarray densifies to float32 before we downcast to float16
+            host_bytes_per_row = num_cols * 4
+        else:
+            host_bytes_per_row = num_cols * 2
+        if score is not None:
+            host_bytes_per_row *= 2
         host_target = 256 * 1024**2
         host_batch = max(64, host_target // max(host_bytes_per_row, 1))
         batch_size = min(batch_size, host_batch)
@@ -502,6 +508,10 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     with torch.inference_mode():
         start = 0
         with tqdm(total=num_rows, desc="refine_social", unit="rows") as pbar:
+            print(
+                f"[refine_social] batch_size={batch_size} num_rows={num_rows} num_cols={num_cols}",
+                flush=True,
+            )
             while start < num_rows:
                 end = min(start + batch_size, num_rows)
 
