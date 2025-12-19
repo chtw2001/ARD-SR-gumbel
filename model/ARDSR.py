@@ -8,6 +8,7 @@ import os
 import tempfile
 import time
 import gc
+from tqdm import tqdm
 import scipy.sparse as sp
 from .DNN import DNN
 
@@ -500,140 +501,152 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
     with torch.inference_mode():
         start = 0
-        while start < num_rows:
-            end = min(start + batch_size, num_rows)
+        with tqdm(total=num_rows, desc="refine_social", unit="rows") as pbar:
+            while start < num_rows:
+                end = min(start + batch_size, num_rows)
 
-            try:
-                idx_tensor = torch.arange(start, end, device=args.device)
+                try:
+                    idx_tensor = torch.arange(start, end, device=args.device)
 
-                with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
-                    if sp.issparse(social_data):
-                        batch_social_np = social_data[start:end].toarray()
-                    else:
-                        batch_social_np = np.asarray(social_data[start:end])
-                        if not batch_social_np.flags["C_CONTIGUOUS"]:
-                            batch_social_np = np.ascontiguousarray(batch_social_np)
-                    if batch_social_np.dtype != np.float16:
-                        batch_social_np = batch_social_np.astype(np.float16, copy=False)
-                    if score is None:
-                        batch_score_np = batch_social_np
-                    else:
-                        batch_score_np = np.asarray(score[start:end])
-                        if not batch_score_np.flags["C_CONTIGUOUS"]:
-                            batch_score_np = np.ascontiguousarray(batch_score_np)
-                        if batch_score_np.dtype != np.float16:
-                            batch_score_np = batch_score_np.astype(np.float16, copy=False)
-                    batch_social_cpu = torch.from_numpy(batch_social_np)
-                    batch_score_cpu = torch.from_numpy(batch_score_np)
-                    if use_cuda:
-                        batch_social_cpu = batch_social_cpu.pin_memory()
-                        batch_score_cpu = batch_score_cpu.pin_memory()
-                    batch_social = batch_social_cpu.to(
-                        args.device, dtype=torch.float16, non_blocking=use_cuda
-                    )
-                    batch_score = batch_score_cpu.to(
-                        args.device, dtype=torch.float16, non_blocking=use_cuda
-                    )
+                    with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
+                        if sp.issparse(social_data):
+                            batch_social_np = social_data[start:end].toarray()
+                        else:
+                            batch_social_np = np.asarray(social_data[start:end])
+                            if not batch_social_np.flags["C_CONTIGUOUS"]:
+                                batch_social_np = np.ascontiguousarray(batch_social_np)
+                        if batch_social_np.dtype != np.float16:
+                            batch_social_np = batch_social_np.astype(np.float16, copy=False)
 
-                    if flip:
-                        batch_embed = all_embed_norm[idx_tensor]
-                        cos_sim = torch.matmul(batch_embed, all_embed_norm_t)
-
-                        flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
-                        prediction = diffusion.p_sample(
-                            flipped_batch,
-                            idx_tensor,
-                            all_embed,
-                            all_social,
-                            args.steps,
-                            args.steps,
+                        if score is None:
+                            batch_score_np = batch_social_np
+                        else:
+                            batch_score_np = np.asarray(score[start:end])
+                            if not batch_score_np.flags["C_CONTIGUOUS"]:
+                                batch_score_np = np.ascontiguousarray(batch_score_np)
+                            if batch_score_np.dtype != np.float16:
+                                batch_score_np = batch_score_np.astype(np.float16, copy=False)
+                        batch_social_cpu = torch.from_numpy(batch_social_np)
+                        batch_score_cpu = torch.from_numpy(batch_score_np)
+                        if use_cuda:
+                            batch_social_cpu = batch_social_cpu.pin_memory()
+                            batch_score_cpu = batch_score_cpu.pin_memory()
+                        batch_social = batch_social_cpu.to(
+                            args.device, dtype=torch.float16, non_blocking=use_cuda
                         )
-                    else:
-                        prediction = diffusion.p_sample(
-                            batch_social, idx_tensor, all_embed, all_social, args.steps, args.steps
+                        batch_score = batch_score_cpu.to(
+                            args.device, dtype=torch.float16, non_blocking=use_cuda
                         )
+
+                        if flip:
+                            batch_embed = all_embed_norm[idx_tensor]
+                            cos_sim = torch.matmul(batch_embed, all_embed_norm_t)
+
+                            flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
+                            prediction = diffusion.p_sample(
+                                flipped_batch,
+                                idx_tensor,
+                                all_embed,
+                                all_social,
+                                args.steps,
+                                args.steps,
+                            )
+                        else:
+                            prediction = diffusion.p_sample(
+                                batch_social,
+                                idx_tensor,
+                                all_embed,
+                                all_social,
+                                args.steps,
+                                args.steps,
+                            )
 
                     prediction = torch.sigmoid(prediction)
                     avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
-            except RuntimeError as exc:
-                if use_cuda and "out of memory" in str(exc).lower() and batch_size > 1:
-                    torch.cuda.empty_cache()
-                    batch_size = max(64, batch_size // 2)
-                    continue
-                raise
+                except RuntimeError as exc:
+                    if use_cuda and "out of memory" in str(exc).lower() and batch_size > 1:
+                        print(
+                            f"[refine_social] CUDA OOM at rows {start}:{end}, reducing batch_size from {batch_size}"
+                        )
+                        torch.cuda.empty_cache()
+                        batch_size = max(64, batch_size // 2)
+                        continue
+                    raise
 
-            # Deletion candidates (working on GPU for speed)
-            existing_mask = batch_social != 0
-            if existing_mask.any():
-                rows, cols = torch.nonzero(existing_mask, as_tuple=True)
-                edge_logits = avg_prediction[rows, cols]
-                under_mask = edge_logits < del_threshold
+                # Deletion candidates (working on GPU for speed)
+                existing_mask = batch_social != 0
+                if existing_mask.any():
+                    rows, cols = torch.nonzero(existing_mask, as_tuple=True)
+                    edge_logits = avg_prediction[rows, cols]
+                    under_mask = edge_logits < del_threshold
 
-                if under_mask.any():
-                    decay = True
-                    del_rows = rows[under_mask]
-                    del_cols = cols[under_mask]
+                    if under_mask.any():
+                        decay = True
+                        del_rows = rows[under_mask]
+                        del_cols = cols[under_mask]
 
-                    h_chunks.append(
-                        (del_rows + start).to("cpu", dtype=torch.int32).numpy()
+                        h_chunks.append(
+                            (del_rows + start).to("cpu", dtype=torch.int32).numpy()
+                        )
+                        t_chunks.append(del_cols.to("cpu", dtype=torch.int32).numpy())
+
+                        # Row-wise add-backs using masked top-k
+                        del_counts = torch.bincount(del_rows, minlength=avg_prediction.size(0))
+                        candidate_rows = del_counts.nonzero(as_tuple=False).flatten()
+                        if candidate_rows.numel() > 0:
+                            # Mask existing edges once for all candidate rows
+                            masked_scores = avg_prediction[candidate_rows]
+                            masked_scores = masked_scores.masked_fill(
+                                existing_mask[candidate_rows], -float("inf")
+                            )
+                            max_k = del_counts.max().item()
+                            topk_vals, topk_idx = torch.topk(
+                                masked_scores, k=min(max_k, num_cols)
+                            )
+                            for row_offset, k in zip(candidate_rows, del_counts[candidate_rows]):
+                                k_int = int(k.item())
+                                if k_int == 0:
+                                    continue
+                                vals = topk_vals[candidate_rows == row_offset][0][:k_int]
+                                cols_sel = topk_idx[candidate_rows == row_offset][0][:k_int]
+                                valid = torch.isfinite(vals)
+                                if valid.any():
+                                    cols_final = cols_sel[valid]
+                                    h_chunks.append(
+                                        (cols_final.new_full((cols_final.numel(),), row_offset + start))
+                                        .to("cpu", dtype=torch.int32)
+                                        .numpy()
+                                    )
+                                    t_chunks.append(
+                                        cols_final.to("cpu", dtype=torch.int32).numpy()
+                                    )
+
+                    # Per-row CE for existing edges (cpu buffer to avoid second pass)
+                    ce_rows = torch.zeros(end - start, device=args.device)
+                    counts = torch.zeros(end - start, device=args.device)
+                    ce_vals = F.binary_cross_entropy_with_logits(
+                        edge_logits.float(),
+                        torch.ones_like(edge_logits, dtype=torch.float32),
+                        reduction="none",
                     )
-                    t_chunks.append(del_cols.to("cpu", dtype=torch.int32).numpy())
+                    ce_rows.index_add_(0, rows, ce_vals)
+                    counts.index_add_(0, rows, torch.ones_like(ce_vals))
+                    nonzero = counts > 0
+                    if nonzero.any():
+                        ce_rows[nonzero] = ce_rows[nonzero] / counts[nonzero]
+                        nz_idx = nonzero.nonzero(as_tuple=False).flatten()
+                        ce_buffer[start + nz_idx.cpu().numpy()] = ce_rows[nz_idx].cpu().numpy()
 
-                    # Row-wise add-backs using masked top-k
-                    del_counts = torch.bincount(del_rows, minlength=avg_prediction.size(0))
-                    candidate_rows = del_counts.nonzero(as_tuple=False).flatten()
-                    if candidate_rows.numel() > 0:
-                        # Mask existing edges once for all candidate rows
-                        masked_scores = avg_prediction[candidate_rows]
-                        masked_scores = masked_scores.masked_fill(
-                            existing_mask[candidate_rows], -float("inf")
-                        )
-                        max_k = del_counts.max().item()
-                        topk_vals, topk_idx = torch.topk(
-                            masked_scores, k=min(max_k, num_cols)
-                        )
-                        for row_offset, k in zip(candidate_rows, del_counts[candidate_rows]):
-                            k_int = int(k.item())
-                            if k_int == 0:
-                                continue
-                            vals = topk_vals[candidate_rows == row_offset][0][:k_int]
-                            cols_sel = topk_idx[candidate_rows == row_offset][0][:k_int]
-                            valid = torch.isfinite(vals)
-                            if valid.any():
-                                cols_final = cols_sel[valid]
-                                h_chunks.append(
-                                    (cols_final.new_full((cols_final.numel(),), row_offset + start))
-                                    .to("cpu", dtype=torch.int32)
-                                    .numpy()
-                                )
-                                t_chunks.append(
-                                    cols_final.to("cpu", dtype=torch.int32).numpy()
-                                )
+                # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
+                if new_score_mm is not None:
+                    new_score_mm[start:end] = avg_prediction.detach().to(
+                        "cpu", dtype=torch.float16
+                    ).numpy()
 
-                # Per-row CE for existing edges (cpu buffer to avoid second pass)
-                ce_rows = torch.zeros(end - start, device=args.device)
-                counts = torch.zeros(end - start, device=args.device)
-                ce_vals = F.binary_cross_entropy_with_logits(
-                    edge_logits.float(),
-                    torch.ones_like(edge_logits, dtype=torch.float32),
-                    reduction="none",
-                )
-                ce_rows.index_add_(0, rows, ce_vals)
-                counts.index_add_(0, rows, torch.ones_like(ce_vals))
-                nonzero = counts > 0
-                if nonzero.any():
-                    ce_rows[nonzero] = ce_rows[nonzero] / counts[nonzero]
-                    nz_idx = nonzero.nonzero(as_tuple=False).flatten()
-                    ce_buffer[start + nz_idx.cpu().numpy()] = ce_rows[nz_idx].cpu().numpy()
+                del avg_prediction, prediction, batch_social, batch_score
+                pbar.update(end - start)
+                start = end
 
-            # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
-            if new_score_mm is not None:
-                new_score_mm[start:end] = avg_prediction.detach().to(
-                    "cpu", dtype=torch.float16
-                ).numpy()
-
-            del avg_prediction, prediction, batch_social, batch_score
-            start = end
 
     if isinstance(new_score_mm, np.memmap):
         new_score_mm.flush()
