@@ -429,6 +429,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     
     # [Optimization] Normalize all_embed once for efficient Cosine Sim
     all_embed_norm = F.normalize(all_embed, p=2, dim=1)
+    all_embed_norm_t = all_embed_norm.t().contiguous()
     
     num_rows = len(social_data)
     num_cols = social_data.shape[1]
@@ -455,24 +456,32 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     h_list = []
     t_list = []
     decay = False
+    
+    use_cuda = args.device != "cpu"
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(num_batches):
             start = i * batch_size
             end = min(start + batch_size, num_rows)
             idx_tensor = torch.arange(start, end, device=args.device)
             
             with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
-                batch_social = torch.tensor(
-                    social_data[start:end], dtype=torch.float16, device=args.device
+                batch_social_np = np.ascontiguousarray(social_data[start:end])
+                batch_score_np = np.ascontiguousarray(score[start:end])
+                batch_social_cpu = torch.from_numpy(batch_social_np)
+                batch_score_cpu = torch.from_numpy(batch_score_np)
+                if use_cuda:
+                    batch_social_cpu = batch_social_cpu.pin_memory()
+                    batch_score_cpu = batch_score_cpu.pin_memory()
+                batch_social = batch_social_cpu.to(
+                    args.device, dtype=torch.float16, non_blocking=use_cuda
                 )
-                batch_score = torch.tensor(
-                    score[start:end], dtype=torch.float16, device=args.device
-                )
+                batch_score = batch_score_cpu.to(
+                    args.device, dtype=torch.float16, non_blocking=use_cuda)
 
                 if flip:
                     batch_embed = all_embed_norm[idx_tensor]
-                    cos_sim = torch.matmul(batch_embed, all_embed_norm.t())
+                    cos_sim = torch.matmul(batch_embed, all_embed_norm_t)
 
                     flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
                     prediction = diffusion.p_sample(
@@ -550,8 +559,7 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
             # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
             new_score_mm[start:end] = avg_prediction.detach().to("cpu", dtype=torch.float16).numpy()
             del avg_prediction, prediction, batch_social, batch_score
-            torch.cuda.empty_cache()
-            gc.collect()
+
 
 
     # Ensure data is flushed to disk before any CPU reads
