@@ -273,12 +273,12 @@ def train(args,log_path):
                 if (epoch-1) % 5 == 0:
                     print('refine social start')
                     refine_start_time=time.time()
-                    h,t,new_score,decay= refine_social(diffusion,social_data.A,new_score,all_embed_frozen,social_embed_frozen,args,del_threshold,flip=True)
+                    h,t,new_score,decay,ce_buffer = refine_social(diffusion,social_data.A,new_score,all_embed_frozen,social_embed_frozen,args,del_threshold,flip=True)
                     if decay:
                         del_threshold = max(del_threshold*0.99,0.45)
 
                     social_data = sp.csr_matrix((np.ones_like(h),(h,t)), dtype='float32', shape=(data.n_users, data.n_users))
-                    ce_for_1s = mean_cross_entropy_for_ones(social_data,new_score)
+                    ce_for_1s = ce_buffer if ce_buffer is not None else mean_cross_entropy_for_ones(social_data,new_score)
                     train_social_dataset = DataDiffusionCL(torch.FloatTensor(social_data.A),epoch,ce_for_1s)
                     diffusion_train_loader = DataLoader(train_social_dataset, batch_size=args.batch_size,shuffle=False, worker_init_fn=worker_init_fn) 
                     data.train_social_h_list=h

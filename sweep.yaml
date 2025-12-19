@@ -8,7 +8,7 @@ parameters:
   lr:
     values: [1e-3] 
   gpu_id:
-    value: 1
+    value: 0
   wandb:
     value: True
   topN:

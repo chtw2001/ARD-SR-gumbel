@@ -7,6 +7,7 @@ import random
 import os
 import tempfile
 import time
+import gc
 from .DNN import DNN
 
 class ARDSR(nn.Module):
@@ -442,101 +443,122 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         tmp_dir,
         f"new_score_{os.getpid()}_{int(time.time())}.mmap",
     )
-    new_score_mm = np.memmap(mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols))
+    new_score_mm = np.lib.format.open_memmap(
+        mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
+    )
+
+    # Preallocate CE buffer so we don't re-read the memmap after writing.
+    ce_buffer = np.zeros(num_rows, dtype=np.float32)
     
     # Pre-move static large tensors to GPU if VRAM allows, otherwise keep on CPU and slice
     # Assuming social_data and score fit in memory but we slice them
-    
+    h_list = []
+    t_list = []
+    decay = False
+
     with torch.no_grad():
         for i in range(num_batches):
             start = i * batch_size
             end = min(start + batch_size, num_rows)
-            
-            # Use slicing directly (assuming input is numpy or tensor)
-            # Keeping inputs on CPU until batching is usually better for very large datasets
             idx_tensor = torch.arange(start, end, device=args.device)
             
-            batch_social = torch.tensor(social_data[start:end], dtype=torch.float16, device=args.device)
-            batch_score = torch.tensor(score[start:end], dtype=torch.float16, device=args.device)
-            
-            if flip:
-                # Compute Cosine Similarity on the fly: (Batch, N)
-                # (Batch, Dim) @ (Dim, N) -> (Batch, N)
-                batch_embed = all_embed_norm[idx_tensor]
-                cos_sim = torch.matmul(batch_embed, all_embed_norm.t())
-                
-                flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
-                prediction = diffusion.p_sample(flipped_batch, idx_tensor, all_embed, all_social, args.steps, args.steps)
-            else:
-                prediction = diffusion.p_sample(batch_social, idx_tensor, all_embed, all_social, args.steps, args.steps)
-            
-            prediction = torch.sigmoid(prediction)
-            avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
-            
-            # Move to CPU immediately to free GPU memory for next batch and
-            # write into the memmap slice.
+            with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
+                batch_social = torch.tensor(
+                    social_data[start:end], dtype=torch.float16, device=args.device
+                )
+                batch_score = torch.tensor(
+                    score[start:end], dtype=torch.float16, device=args.device
+                )
+
+                if flip:
+                    batch_embed = all_embed_norm[idx_tensor]
+                    cos_sim = torch.matmul(batch_embed, all_embed_norm.t())
+
+                    flipped_batch = flip_tensor(batch_social, cos_sim, args.seed)
+                    prediction = diffusion.p_sample(
+                        flipped_batch,
+                        idx_tensor,
+                        all_embed,
+                        all_social,
+                        args.steps,
+                        args.steps,
+                    )
+                else:
+                    prediction = diffusion.p_sample(
+                        batch_social, idx_tensor, all_embed, all_social, args.steps, args.steps
+                    )
+
+                prediction = torch.sigmoid(prediction)
+                avg_prediction = args.decay * batch_score + (1 - args.decay) * prediction
+
+            # Deletion candidates (working on GPU for speed)
+            existing_mask = batch_social != 0
+            if existing_mask.any():
+                rows, cols = torch.nonzero(existing_mask, as_tuple=True)
+                edge_logits = avg_prediction[rows, cols]
+                under_mask = edge_logits < del_threshold
+
+                if under_mask.any():
+                    decay = True
+                    del_rows = rows[under_mask]
+                    del_cols = cols[under_mask]
+
+                    h_list.extend((del_rows + start).tolist())
+                    t_list.extend(del_cols.tolist())
+
+                    # Row-wise add-backs using masked top-k
+                    del_counts = torch.bincount(del_rows, minlength=avg_prediction.size(0))
+                    candidate_rows = del_counts.nonzero(as_tuple=False).flatten()
+                    if candidate_rows.numel() > 0:
+                        # Mask existing edges once for all candidate rows
+                        masked_scores = avg_prediction[candidate_rows]
+                        masked_scores = masked_scores.masked_fill(
+                            existing_mask[candidate_rows], -float("inf")
+                        )
+                        max_k = del_counts.max().item()
+                        topk_vals, topk_idx = torch.topk(
+                            masked_scores, k=min(max_k, num_cols)
+                        )
+                        for row_offset, k in zip(candidate_rows, del_counts[candidate_rows]):
+                            k_int = int(k.item())
+                            if k_int == 0:
+                                continue
+                            vals = topk_vals[candidate_rows == row_offset][0][:k_int]
+                            cols_sel = topk_idx[candidate_rows == row_offset][0][:k_int]
+                            valid = torch.isfinite(vals)
+                            if valid.any():
+                                cols_final = cols_sel[valid]
+                                h_list.extend([row_offset.item() + start] * cols_final.numel())
+                                t_list.extend(cols_final.tolist())
+
+                # Per-row CE for existing edges (cpu buffer to avoid second pass)
+                ce_rows = torch.zeros(end - start, device=args.device)
+                counts = torch.zeros(end - start, device=args.device)
+                ce_vals = F.binary_cross_entropy_with_logits(
+                    edge_logits.float(),
+                    torch.ones_like(edge_logits, dtype=torch.float32),
+                    reduction="none",
+                )
+                ce_rows.index_add_(0, rows, ce_vals)
+                counts.index_add_(0, rows, torch.ones_like(ce_vals))
+                nonzero = counts > 0
+                if nonzero.any():
+                    ce_rows[nonzero] = ce_rows[nonzero] / counts[nonzero]
+                    nz_idx = nonzero.nonzero(as_tuple=False).flatten()
+                    ce_buffer[start + nz_idx.cpu().numpy()] = ce_rows[nz_idx].cpu().numpy()
+
+            # Move to CPU immediately to free GPU memory for next batch and write into the memmap slice.
             new_score_mm[start:end] = avg_prediction.detach().to("cpu", dtype=torch.float16).numpy()
+            del avg_prediction, prediction, batch_social, batch_score
+            torch.cuda.empty_cache()
+            gc.collect()
+
 
     # Ensure data is flushed to disk before any CPU reads
     new_score_mm.flush()
     new_score_cpu = new_score_mm
     
-    # [Optimization] GPU-based Top-K and Filtering
-    # Moving logic from CPU list comprehension to Torch operations
-    
-    # 1. Identify Edges to Delete / Add (chunked on CPU to avoid huge flatten top-k)
-    # Keep heavy masking and top-k selection on CPU to limit GPU time and memory
-    # when the adjacency matrix is large and steps are high (e.g., steps=100).
-    social_cpu = torch.as_tensor(social_data, device="cpu") if not torch.is_tensor(social_data) else social_data.cpu()
-
-    h_list = []
-    t_list = []
-
-    chunk = 512  # smaller chunks reduce per-iteration overhead on very large graphs
-    decay = False
-
-    for start in range(0, num_rows, chunk):
-        end = min(start + chunk, num_rows)
-        score_chunk = torch.from_numpy(new_score_cpu[start:end]).float()
-        social_chunk = social_cpu[start:end]
-
-        # Existing edges and scores for the current chunk
-        existing_mask = social_chunk != 0
-        if existing_mask.sum() == 0:
-            continue
-
-        rows, cols = torch.nonzero(existing_mask, as_tuple=True)
-        scores_on_edges = score_chunk[rows, cols]
-        under_mask = scores_on_edges < del_threshold
-
-        if under_mask.any():
-            decay = True
-            del_rows = rows[under_mask]
-            del_cols = cols[under_mask]
-
-            # Track deletions
-            h_list.extend((del_rows + start).tolist())
-            t_list.extend(del_cols.tolist())
-
-            # Determine how many additions per row (match deletions per row)
-            del_counts = torch.bincount(del_rows, minlength=score_chunk.size(0))
-
-            for local_row in del_counts.nonzero(as_tuple=False).flatten():
-                k = del_counts[local_row].item()
-                if k == 0:
-                    continue
-                row_idx = local_row.item()
-                row_scores = score_chunk[row_idx]
-                # Mask out existing edges to avoid re-adding them
-                masked_row = row_scores.masked_fill(existing_mask[row_idx], -float("inf"))
-                topk_vals, topk_idx = torch.topk(masked_row, min(k, num_cols))
-                valid = torch.isfinite(topk_vals)
-                if valid.any():
-                    selected_cols = topk_idx[valid]
-                    h_list.extend([row_idx + start] * selected_cols.numel())
-                    t_list.extend(selected_cols.tolist())
-
-    return h_list, t_list, new_score_cpu, decay
+    return h_list, t_list, new_score_cpu, decay, ce_buffer
 
 
 def flip_tensor(batch, cos_similarities, seed):
