@@ -456,12 +456,20 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
         tmp_dir,
         f"new_score_{os.getpid()}_{int(time.time())}.mmap",
     )
-    try:
-        new_score_mm = np.empty((num_rows, num_cols), dtype=np.float16)
-    except MemoryError:
+    score_bytes = num_rows * num_cols * np.dtype(np.float16).itemsize
+    max_in_memory_bytes = 2 * 1024**3
+    use_memmap = score_bytes > max_in_memory_bytes
+    if use_memmap:
         new_score_mm = np.lib.format.open_memmap(
             mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
         )
+    else:
+        try:
+            new_score_mm = np.empty((num_rows, num_cols), dtype=np.float16)
+        except MemoryError:
+            new_score_mm = np.lib.format.open_memmap(
+                mmap_path, mode="w+", dtype=np.float16, shape=(num_rows, num_cols)
+            )
 
     # Preallocate CE buffer so we don't re-read the memmap after writing.
     ce_buffer = np.zeros(num_rows, dtype=np.float32)
