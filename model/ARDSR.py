@@ -351,7 +351,10 @@ class ARDSR(nn.Module):
         model_output = self.MLP(x, batch_embed, t_batch)
 
         pred_xstart = model_output
-        
+        if model_variance.device != x.device:
+            # Move all cached slices required for this step to the current device
+            model_variance = model_variance.to(x.device)
+
         # 정수 t를 사용하여 계수(Coefficient) 추출
         if model_variance.device != x.device:
             # Move all cached slices required for this step to the current device
@@ -485,6 +488,9 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
     
     # Pre-move static large tensors to GPU if VRAM allows, otherwise keep on CPU and slice
     # Assuming social_data and score fit in memory but we slice them
+    h_list = []
+    t_list = []
+    decay = False
     
     h_list = []
     t_list = []

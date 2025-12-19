@@ -240,7 +240,7 @@ def train(args,log_path):
                         model.init_channel()
                         
         elif args.method == "original":
-            if epoch >10:
+            if epoch >0:
                 diffusion_epoch+=1
                 print("Training Diffusion")
                 ##Retrive user embedding from SR backbone for guidance
@@ -271,7 +271,7 @@ def train(args,log_path):
                                 "%H: %M: %S", time.gmtime(time.time()-diffusion_start_time)))
 
                 if (epoch-1) % 5 == 0:
-                        
+                    print('refine social start')
                     refine_start_time=time.time()
                     h,t,new_score,decay,ce_buffer = refine_social(diffusion,social_data.A,new_score,all_embed_frozen,social_embed_frozen,args,del_threshold,flip=True)
                     if decay:
