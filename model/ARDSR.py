@@ -510,9 +510,14 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
 
                     with torch.cuda.amp.autocast(enabled=(args.device != "cpu")):
                         if sp.issparse(social_data):
-                            batch_social_np = social_data[start:end].toarray().astype(
-                                np.float16, copy=False
-                            )
+                            try:
+                                batch_social_np = social_data[start:end].toarray().astype(
+                                    np.float16, copy=False
+                                )
+                            except MemoryError:
+                                raise MemoryError(
+                                    f"Host OOM converting rows {start}:{end} to dense"
+                                )
                         else:
                             batch_social_np = np.asarray(social_data[start:end])
                             if not batch_social_np.flags["C_CONTIGUOUS"]:
@@ -568,7 +573,8 @@ def refine_social(diffusion, social_data, score, all_embed, all_social, args, de
                 except (RuntimeError, MemoryError) as exc:
                     if isinstance(exc, MemoryError):
                         print(
-                            f"[refine_social] Host OOM at rows {start}:{end}, reducing batch_size from {batch_size}"
+                            f"[refine_social] Host OOM at rows {start}:{end}, reducing batch_size from {batch_size}",
+                            flush=True,
                         )
                         batch_size = max(64, batch_size // 2)
                         gc.collect()
